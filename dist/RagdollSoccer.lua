@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.3.0 (bundled by build.py)
+-- Ragdoll Soccer v0.4.0 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.3.0"
+__env.RSVersion = "0.4.0"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -1744,11 +1744,12 @@ local Log = __import("game/log")
 
 local Kick = {
 	Aim = false, Boost = true, BoostMax = 2.2, AllKicks = true, MaxDist = 400, Corner = "Far from keeper",
+	Rocket = true, RocketFrom = 70, RocketHeight = 0, RocketTune = 1.0,
 	Shots = 0, Notify = nil, Info = "off",
 }
 Kick.Corners = { "Far from keeper", "Left post", "Right post", "Centre" }
 
-local lastAim = { rot = nil, dist = 0, t = -99 }
+local lastAim = { rot = nil, dir = nil, dist = 0, t = -99 }
 local rejectConn
 
 local function onPlan(args)
@@ -1771,6 +1772,7 @@ local function onPlan(args)
 	np.dir = newDir
 	lastAim.rot = CFrame.lookAt(Vector3.zero, newDir) * CFrame.lookAt(Vector3.zero, oldUnit):Inverse()
 	lastAim.dist = toGoal.Magnitude
+	lastAim.dir = newDir
 	lastAim.t = os.clock()
 	Kick.Shots = Kick.Shots + 1
 	Log.add(("KickPlan aimed at goal: %d studs, family %s, power %s"):format(math.floor(toGoal.Magnitude), tostring(plan.family), tostring(plan.power)))
@@ -1786,17 +1788,33 @@ local function onRelease(args)
 	if typeof(vel) ~= "Vector3" then return nil end
 	local v = lastAim.rot * vel
 	local scale = 1
-	if Kick.Boost then
+	local rocket = Kick.Rocket and lastAim.dist >= Kick.RocketFrom and lastAim.dir ~= nil
+	if rocket then
+		-- ROCKET: a high arc that comes down on the goal. Ballistic solution with the ball's own gravity (attribute Gravity, 46 in the dump):
+		-- up to height H and down again takes T seconds, so the horizontal speed is distance / T. Spin is dropped so nothing bends the flight.
+		local ball = World.ball()
+		local g = (ball and tonumber(ball:GetAttribute("Gravity"))) or 46
+		local H = Kick.RocketHeight > 0 and Kick.RocketHeight or math.clamp(lastAim.dist * 0.4, 30, 120)
+		local up = math.sqrt(2 * H / g)
+		local down = math.sqrt(2 * (H + 0.5) / g)
+		local vh = lastAim.dist / (up + down) * Kick.RocketTune
+		v = lastAim.dir * vh + Vector3.new(0, g * up, 0)
+		scale = vh
+		Log.add(("ROCKET: %d studs, apex %d, horizontal %.0f, up %.0f (g %.0f)"):format(math.floor(lastAim.dist), math.floor(H), vh, g * up, g))
+		Kick.Landing(lastAim.dir, lastAim.dist)
+	elseif Kick.Boost then
 		-- farther goal -> more speed: 1.0x up to about 40 studs, then growing, capped at BoostMax. Height is kept, so the arc stays the same.
 		scale = math.clamp(0.5 + lastAim.dist / 80, 1, Kick.BoostMax)
 		v = Vector3.new(v.X * scale, v.Y, v.Z * scale)
 	end
 	local out = table.clone(args)
 	out[4] = v
-	if typeof(args[7]) == "Vector3" then out[7] = lastAim.rot * args[7] end
+	if typeof(args[7]) == "Vector3" then out[7] = rocket and Vector3.zero or lastAim.rot * args[7] end
 	lastAim.rot = nil
-	Log.add(("DribbleRelease rotated, speed x%.2f"):format(scale))
-	if Kick.Notify then Kick.Notify(("Shot at goal  -  %d st  -  power x%.1f"):format(math.floor(lastAim.dist), scale)) end
+	if not rocket then Log.add(("DribbleRelease rotated, speed x%.2f"):format(scale)) end
+	if Kick.Notify then
+		Kick.Notify(rocket and ("ROCKET  -  %d st"):format(math.floor(lastAim.dist)) or ("Shot at goal  -  %d st  -  power x%.1f"):format(math.floor(lastAim.dist), scale))
+	end
 	return out
 end
 
@@ -1816,6 +1834,39 @@ local function watchRejects()
 	end)
 end
 
+-- after a rocket: where did the ball come down? (along the aim line, compared with where it should have)
+local landing
+function Kick.Landing(dir, want)
+	local ball = World.ball()
+	if not ball then return end
+	local start = ball.Position
+	if landing then landing:Disconnect() end
+	local t0 = os.clock()
+	landing = game:GetService("RunService").Heartbeat:Connect(function()
+		local dt = os.clock() - t0
+		local b = World.ball()
+		if not b or dt > 9 then
+			if landing then landing:Disconnect(); landing = nil end
+			return
+		end
+		if dt > 0.8 and b.Position.Y < start.Y + 1.2 then
+			local d = World.horiz(b.Position - start):Dot(dir)
+			Log.add(("ROCKET landed %.0f studs along the aim (wanted %.0f, side %.0f)"):format(d, want, (World.horiz(b.Position - start) - dir * d).Magnitude))
+			landing:Disconnect(); landing = nil
+		end
+	end)
+end
+
+local flightConn
+local function watchFlight()
+	local ball = World.ball()
+	if not ball or flightConn then return end
+	flightConn = ball:GetAttributeChangedSignal("KickFlight"):Connect(function()
+		-- what the SERVER decided for the kick (to compare with what we sent)
+		Log.add("server KickFlight: " .. tostring(ball:GetAttribute("KickFlight")):sub(1, 140))
+	end)
+end
+
 function Kick.SetAim(on)
 	Kick.Aim = on
 	if on then
@@ -1823,6 +1874,7 @@ function Kick.SetAim(on)
 		Net.On("KickPlan", onPlan)
 		Net.On("DribbleRelease", onRelease)
 		watchRejects()
+		watchFlight()
 		Kick.Info = "aiming"
 	else
 		Net.Off("KickPlan"); Net.Off("DribbleRelease")
@@ -1834,6 +1886,8 @@ end
 function Kick.Destroy()
 	Kick.SetAim(false)
 	if rejectConn then rejectConn:Disconnect(); rejectConn = nil end
+	if flightConn then flightConn:Disconnect(); flightConn = nil end
+	if landing then landing:Disconnect(); landing = nil end
 end
 
 return Kick
@@ -1852,13 +1906,51 @@ local World = __import("game/world")
 local Log = __import("game/log")
 
 local Fun = {
+	RainbowBall = false, AimLine = false, Corner = "Far from keeper",
 	Spin = false, SpinRate = 900, Moonwalk = false, Sideways = false, Jitter = false, JitterSize = 1.6, Magnet = false, MagnetRange = 60,
 }
 
 local conn
 local spinAngle, lastMagnet, jitterFlip = 0, -99, 1
 
+local line, hue = nil, 0
+local function ensureLine()
+	if line and line.Parent then return line end
+	line = Instance.new("Part")
+	line.Name = tostring(math.random(1e6, 9e6)); line.Anchored = true; line.CanCollide = false; line.CanQuery = false; line.CanTouch = false
+	line.Material = Enum.Material.Neon; line.Color = Color3.fromRGB(80, 220, 140); line.Transparency = 0.35
+	line.Size = Vector3.new(0.25, 0.25, 1); line.Parent = workspace
+	return line
+end
+local function killLine()
+	if line then pcall(function() line:Destroy() end); line = nil end
+end
+
+local function visuals(dt)
+	local ball = World.ball()
+	if Fun.RainbowBall and ball then
+		hue = (hue + dt * 0.6) % 1
+		pcall(function() ball.Color = Color3.fromHSV(hue, 0.85, 1) end)
+	end
+	if Fun.AimLine and ball then
+		local me = World.me()
+		local target = me and World.shotTarget(me.team, ball.Position, Fun.Corner)
+		if target and (me.root.Position - ball.Position).Magnitude < 40 then
+			local a, b = ball.Position, target
+			local l = ensureLine()
+			local len = (b - a).Magnitude
+			l.Size = Vector3.new(0.25, 0.25, math.max(len, 0.1))
+			l.CFrame = CFrame.lookAt(a, b) * CFrame.new(0, 0, -len / 2)
+		else
+			killLine()
+		end
+	elseif line then
+		killLine()
+	end
+end
+
 local function step(dt)
+	visuals(dt)
 	if not (Fun.Spin or Fun.Moonwalk or Fun.Sideways or Fun.Jitter or Fun.Magnet) then return end
 	local me = World.me()
 	if not me or not me.cm then return end
@@ -1914,7 +2006,8 @@ end
 
 function Fun.Destroy()
 	if conn then conn:Disconnect(); conn = nil end
-	Fun.Spin, Fun.Moonwalk, Fun.Sideways, Fun.Jitter, Fun.Magnet = false, false, false, false, false
+	killLine()
+	Fun.Spin, Fun.Moonwalk, Fun.Sideways, Fun.Jitter, Fun.Magnet, Fun.RainbowBall, Fun.AimLine = false, false, false, false, false, false, false
 end
 
 return Fun
@@ -1951,7 +2044,7 @@ Kick.Notify = function(msg) win:Notify(msg, 2) end
 -- RONALDINI ---------------------------------------------------------------------------------------------------------------
 local tMain = win:Tab("Ronaldini", { Section = "Play", Icon = 13 })
 local speedMult, sticky, accurate = 1.0, true, true
-local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false }
+local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false, RainbowBall = false, AimLine = false }
 local mBan
 
 local function applyFun(on)
@@ -1972,8 +2065,12 @@ mBan = tMain:Module({ Name = "Ronaldini Banini", Default = false, Callback = app
 local key = mBan:Keybind({ Name = "Toggle key", Default = Enum.KeyCode.Z })
 
 mBan:Section("Your shots")
-mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v end })
+mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v; Fun.Corner = v end })
 mBan:Choice({ Name = "Applies to", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
+mBan:Toggle({ Name = "ROCKET: far shots fly up high and drop on the goal", Default = Kick.Rocket, Callback = function(v) Kick.Rocket = v end })
+mBan:Slider({ Name = "Rocket from", Min = 30, Max = 300, Step = 5, Default = Kick.RocketFrom, Suffix = " st", Callback = function(v) Kick.RocketFrom = v end })
+mBan:Slider({ Name = "Rocket height (0 = automatic)", Min = 0, Max = 160, Step = 5, Default = Kick.RocketHeight, Suffix = " st", Callback = function(v) Kick.RocketHeight = v end })
+mBan:Slider({ Name = "Rocket range tuning", Min = 0.6, Max = 1.6, Step = 0.02, Default = Kick.RocketTune, Suffix = "x", Callback = function(v) Kick.RocketTune = v end })
 mBan:Toggle({ Name = "Power boost (more speed the farther you are)", Default = Kick.Boost, Callback = function(v) Kick.Boost = v end })
 mBan:Slider({ Name = "Max power boost", Min = 1, Max = 4, Step = 0.1, Default = Kick.BoostMax, Suffix = "x", Callback = function(v) Kick.BoostMax = v end })
 mBan:Slider({ Name = "Works up to", Min = 40, Max = 500, Step = 10, Default = Kick.MaxDist, Suffix = " st", Callback = function(v) Kick.MaxDist = v end })
@@ -1990,6 +2087,8 @@ mBan:Section("Funny")
 local function fun(name, label)
 	mBan:Toggle({ Name = label, Default = false, Callback = function(v) funState[name] = v; if mBan:Get() then Fun[name] = v end end })
 end
+mBan:Toggle({ Name = "Rainbow ball", Default = false, Callback = function(v) funState.RainbowBall = v; if mBan:Get() then Fun.RainbowBall = v end end })
+mBan:Toggle({ Name = "Aim line (shows where the shot goes)", Default = false, Callback = function(v) funState.AimLine = v; if mBan:Get() then Fun.AimLine = v end end })
 fun("Spin", "Spinbot")
 mBan:Slider({ Name = "Spin speed", Min = 90, Max = 3000, Step = 30, Default = Fun.SpinRate, Suffix = " deg/s", Callback = function(v) Fun.SpinRate = v end })
 fun("Moonwalk", "Moonwalk (face away from where you run)")

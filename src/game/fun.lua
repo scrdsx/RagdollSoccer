@@ -9,13 +9,51 @@ local World = __import("game/world")
 local Log = __import("game/log")
 
 local Fun = {
+	RainbowBall = false, AimLine = false, Corner = "Far from keeper",
 	Spin = false, SpinRate = 900, Moonwalk = false, Sideways = false, Jitter = false, JitterSize = 1.6, Magnet = false, MagnetRange = 60,
 }
 
 local conn
 local spinAngle, lastMagnet, jitterFlip = 0, -99, 1
 
+local line, hue = nil, 0
+local function ensureLine()
+	if line and line.Parent then return line end
+	line = Instance.new("Part")
+	line.Name = tostring(math.random(1e6, 9e6)); line.Anchored = true; line.CanCollide = false; line.CanQuery = false; line.CanTouch = false
+	line.Material = Enum.Material.Neon; line.Color = Color3.fromRGB(80, 220, 140); line.Transparency = 0.35
+	line.Size = Vector3.new(0.25, 0.25, 1); line.Parent = workspace
+	return line
+end
+local function killLine()
+	if line then pcall(function() line:Destroy() end); line = nil end
+end
+
+local function visuals(dt)
+	local ball = World.ball()
+	if Fun.RainbowBall and ball then
+		hue = (hue + dt * 0.6) % 1
+		pcall(function() ball.Color = Color3.fromHSV(hue, 0.85, 1) end)
+	end
+	if Fun.AimLine and ball then
+		local me = World.me()
+		local target = me and World.shotTarget(me.team, ball.Position, Fun.Corner)
+		if target and (me.root.Position - ball.Position).Magnitude < 40 then
+			local a, b = ball.Position, target
+			local l = ensureLine()
+			local len = (b - a).Magnitude
+			l.Size = Vector3.new(0.25, 0.25, math.max(len, 0.1))
+			l.CFrame = CFrame.lookAt(a, b) * CFrame.new(0, 0, -len / 2)
+		else
+			killLine()
+		end
+	elseif line then
+		killLine()
+	end
+end
+
 local function step(dt)
+	visuals(dt)
 	if not (Fun.Spin or Fun.Moonwalk or Fun.Sideways or Fun.Jitter or Fun.Magnet) then return end
 	local me = World.me()
 	if not me or not me.cm then return end
@@ -71,7 +109,8 @@ end
 
 function Fun.Destroy()
 	if conn then conn:Disconnect(); conn = nil end
-	Fun.Spin, Fun.Moonwalk, Fun.Sideways, Fun.Jitter, Fun.Magnet = false, false, false, false, false
+	killLine()
+	Fun.Spin, Fun.Moonwalk, Fun.Sideways, Fun.Jitter, Fun.Magnet, Fun.RainbowBall, Fun.AimLine = false, false, false, false, false, false, false
 end
 
 return Fun

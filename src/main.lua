@@ -27,7 +27,7 @@ Kick.Notify = function(msg) win:Notify(msg, 2) end
 -- RONALDINI ---------------------------------------------------------------------------------------------------------------
 local tMain = win:Tab("Ronaldini", { Section = "Play", Icon = 13 })
 local speedMult, sticky, accurate = 1.0, true, true
-local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false }
+local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false, RainbowBall = false, AimLine = false }
 local mBan
 
 local function applyFun(on)
@@ -48,8 +48,12 @@ mBan = tMain:Module({ Name = "Ronaldini Banini", Default = false, Callback = app
 local key = mBan:Keybind({ Name = "Toggle key", Default = Enum.KeyCode.Z })
 
 mBan:Section("Your shots")
-mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v end })
+mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v; Fun.Corner = v end })
 mBan:Choice({ Name = "Applies to", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
+mBan:Toggle({ Name = "ROCKET: far shots fly up high and drop on the goal", Default = Kick.Rocket, Callback = function(v) Kick.Rocket = v end })
+mBan:Slider({ Name = "Rocket from", Min = 30, Max = 300, Step = 5, Default = Kick.RocketFrom, Suffix = " st", Callback = function(v) Kick.RocketFrom = v end })
+mBan:Slider({ Name = "Rocket height (0 = automatic)", Min = 0, Max = 160, Step = 5, Default = Kick.RocketHeight, Suffix = " st", Callback = function(v) Kick.RocketHeight = v end })
+mBan:Slider({ Name = "Rocket range tuning", Min = 0.6, Max = 1.6, Step = 0.02, Default = Kick.RocketTune, Suffix = "x", Callback = function(v) Kick.RocketTune = v end })
 mBan:Toggle({ Name = "Power boost (more speed the farther you are)", Default = Kick.Boost, Callback = function(v) Kick.Boost = v end })
 mBan:Slider({ Name = "Max power boost", Min = 1, Max = 4, Step = 0.1, Default = Kick.BoostMax, Suffix = "x", Callback = function(v) Kick.BoostMax = v end })
 mBan:Slider({ Name = "Works up to", Min = 40, Max = 500, Step = 10, Default = Kick.MaxDist, Suffix = " st", Callback = function(v) Kick.MaxDist = v end })
@@ -66,6 +70,8 @@ mBan:Section("Funny")
 local function fun(name, label)
 	mBan:Toggle({ Name = label, Default = false, Callback = function(v) funState[name] = v; if mBan:Get() then Fun[name] = v end end })
 end
+mBan:Toggle({ Name = "Rainbow ball", Default = false, Callback = function(v) funState.RainbowBall = v; if mBan:Get() then Fun.RainbowBall = v end end })
+mBan:Toggle({ Name = "Aim line (shows where the shot goes)", Default = false, Callback = function(v) funState.AimLine = v; if mBan:Get() then Fun.AimLine = v end end })
 fun("Spin", "Spinbot")
 mBan:Slider({ Name = "Spin speed", Min = 90, Max = 3000, Step = 30, Default = Fun.SpinRate, Suffix = " deg/s", Callback = function(v) Fun.SpinRate = v end })
 fun("Moonwalk", "Moonwalk (face away from where you run)")
