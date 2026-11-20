@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.5.0 (bundled by build.py)
+-- Ragdoll Soccer v0.6.0 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.5.0"
+__env.RSVersion = "0.6.0"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -1732,26 +1732,29 @@ end
 
 __mods["game/kick"] = function()
 -- Kick: assist for YOUR shots. You still aim, charge and kick yourself; this changes what is sent to the server.
---  The game computes a kick locally and sends KickPlan (the plan: dir, power, family ...) and then DribbleRelease (ball position, launch velocity, spin ...).
---  * Aim:   the horizontal direction is turned to a point inside the opponent's goal (away from the keeper). KickPlan.dir is replaced and the release velocity /
---           spin are rotated by the same angle, so the two still agree with each other.
---  * Boost: the horizontal speed of the release is scaled, more for longer distances (a shot from far still arrives, and the keeper gets less time).
-local Players = game:GetService("Players")
+--  The game computes a kick locally and sends KickPlan (the plan: dir, power, family ...) and then DribbleRelease (ball position, launch velocity, spin, family).
+--  * Aim:        the horizontal direction is turned to a point inside the opponent's goal (away from the keeper). KickPlan.dir is replaced and the release velocity /
+--                spin are rotated by the same angle, so the two still agree with each other.
+--  * Super shot: the kick is sent as the strongest family ("Power") with the highest speed the server allows, along the FLATTEST path that still reaches the goal
+--                (solved with the game's own drag and gravity), so the ball arrives as fast as possible. The server clamps the speed per kick family (seen in the log:
+--                Backheel ~75, RunOutside ~117, Laced ~138, Power ~156); the clamp is learned from the server's reply, so every shot asks for a bit more until it is found.
 local RS = game:GetService("ReplicatedStorage")
 local World = __import("game/world")
 local Net = __import("game/net")
 local Log = __import("game/log")
 
 local Kick = {
-	Aim = false, Boost = true, BoostMax = 2.2, AllKicks = true, MaxDist = 400, Corner = "Far from keeper",
-	Rocket = true, RocketFrom = 70, RocketStyle = "Missile (fast, flat)", RocketTune = 1.0,
+	Aim = false, Super = true, Family = "Power", MaxAngle = 55, AllKicks = true, MaxDist = 400, Corner = "Far from keeper",
 	Shots = 0, Notify = nil, Info = "off",
 }
 Kick.Corners = { "Far from keeper", "Left post", "Right post", "Centre" }
+Kick.Families = { "Power", "Laced", "Finesse" }
+Kick.Cap = {}      -- family -> highest speed the server has accepted so far
+local CAP_GUESS = 150
 
-Kick.ANGLES = { ["Missile (fast, flat)"] = 14, ["Rocket"] = 32, ["Lob (high, slow)"] = 58 }
-Kick.Styles = { "Missile (fast, flat)", "Rocket", "Lob (high, slow)" }
-Kick.MaxSpeed = 320
+local lastAim = { rot = nil, dir = nil, dist = 0, y = 1.9, t = -99 }
+local lastSuper = { t = -99, family = nil }
+local rejectConn, flightConn
 
 -- height of the ball when it has travelled `dist` horizontally, launched at speed s and angle ang (quadratic drag, gravity g); -1e9 if it lands before
 local function heightAt(s, ang, dist, y0, g, k)
@@ -1770,19 +1773,17 @@ local function heightAt(s, ang, dist, y0, g, k)
 	return -1e9
 end
 
--- the smallest speed for which the ball is still at height `yt` when it reaches `dist` (a coming-down crossing)
-function Kick.Solve(dist, ang, y0, yt, g, k)
-	local lo, hi = 4, Kick.MaxSpeed
-	if heightAt(hi, ang, dist, y0, g, k) < yt then return hi end -- cannot get there at this angle: as fast as allowed
-	for _ = 1, 28 do
+-- the flattest launch angle (radians) that still has the ball at height yt when it reaches dist, at a fixed speed
+function Kick.SolveAngle(dist, speed, y0, yt, g, k, maxDeg)
+	local lo, hi = math.rad(1), math.rad(maxDeg)
+	if heightAt(speed, hi, dist, y0, g, k) < yt then return hi end -- not reachable: steepest allowed
+	if heightAt(speed, lo, dist, y0, g, k) >= yt then return lo end -- reachable flat
+	for _ = 1, 26 do
 		local mid = (lo + hi) / 2
-		if heightAt(mid, ang, dist, y0, g, k) >= yt then hi = mid else lo = mid end
+		if heightAt(speed, mid, dist, y0, g, k) >= yt then hi = mid else lo = mid end
 	end
 	return hi
 end
-
-local lastAim = { rot = nil, dir = nil, dist = 0, t = -99 }
-local rejectConn
 
 local function onPlan(args)
 	local plan = args[1]
@@ -1802,13 +1803,14 @@ local function onPlan(args)
 	end
 	local np = table.clone(plan)
 	np.dir = newDir
+	if Kick.Super then np.family = Kick.Family; np.power = 1 end
 	lastAim.rot = CFrame.lookAt(Vector3.zero, newDir) * CFrame.lookAt(Vector3.zero, oldUnit):Inverse()
 	lastAim.dist = toGoal.Magnitude
 	lastAim.dir = newDir
 	lastAim.y = plan.ball.Y
 	lastAim.t = os.clock()
 	Kick.Shots = Kick.Shots + 1
-	Log.add(("KickPlan aimed at goal: %d studs, family %s, power %s"):format(math.floor(toGoal.Magnitude), tostring(plan.family), tostring(plan.power)))
+	Log.add(("KickPlan aimed at goal: %d studs, family %s -> %s, power %s"):format(math.floor(toGoal.Magnitude), tostring(plan.family), Kick.Super and Kick.Family or "unchanged", tostring(plan.power)))
 	local out = table.clone(args)
 	out[1] = np
 	return out
@@ -1819,40 +1821,36 @@ local function onRelease(args)
 	if not lastAim.rot or os.clock() - lastAim.t > 1.5 then return nil end
 	local vel = args[4]
 	if typeof(vel) ~= "Vector3" then return nil end
+	local out = table.clone(args)
 	local v = lastAim.rot * vel
-	local scale = 1
-	local rocket = Kick.Rocket and lastAim.dist >= Kick.RocketFrom and lastAim.dir ~= nil
-	if rocket then
-		-- ROCKET: the launch speed that makes the ball arrive at the goal. The game's flight model has a quadratic air drag (BallPath: drag = 0.0243 * AirDrag * 0.213)
-		-- and the ball's own gravity (attribute Gravity, 46), so the arrival is solved numerically instead of with the drag-free formula (which fell far short).
+	local note
+	if Kick.Super and lastAim.dir then
 		local ball = World.ball()
 		local g = (ball and tonumber(ball:GetAttribute("Gravity"))) or 46
 		local air = (ball and tonumber(ball:GetAttribute("AirDrag"))) or 1
 		local k = 0.024366064765727467 * air * 0.213
-		local ang = math.rad(Kick.ANGLES[Kick.RocketStyle] or 16)
-		local y0 = lastAim.y or 1.9
-		local s = Kick.Solve(lastAim.dist * Kick.RocketTune, ang, y0, y0 + 0.9, g, k)
-		v = lastAim.dir * (s * math.cos(ang)) + Vector3.new(0, s * math.sin(ang), 0)
-		scale = s
-		Log.add(("ROCKET %s: %d studs, speed %.0f at %d deg (g %.0f, drag %.4f)"):format(Kick.RocketStyle, math.floor(lastAim.dist), s, math.floor(math.deg(ang)), g, k))
-		Kick.Landing(lastAim.dir, lastAim.dist)
-	elseif Kick.Boost then
-		-- farther goal -> more speed: 1.0x up to about 40 studs, then growing, capped at BoostMax. Height is kept, so the arc stays the same.
-		scale = math.clamp(0.5 + lastAim.dist / 80, 1, Kick.BoostMax)
-		v = Vector3.new(v.X * scale, v.Y, v.Z * scale)
+		local cap = Kick.Cap[Kick.Family] or CAP_GUESS
+		local ask = cap * 1.12 -- a little above what has been accepted so far; the server clamps and the reply tells the real limit
+		local y0 = lastAim.y
+		local ang = Kick.SolveAngle(lastAim.dist, cap, y0, y0 + 0.9, g, k, Kick.MaxAngle)
+		v = lastAim.dir * (ask * math.cos(ang)) + Vector3.new(0, ask * math.sin(ang), 0)
+		out[8] = Kick.Family
+		out[7] = Vector3.zero
+		lastSuper.t, lastSuper.family = os.clock(), Kick.Family
+		note = ("SUPER SHOT  -  %d st  -  %d studs/s"):format(math.floor(lastAim.dist), math.floor(ask))
+		Log.add(("SUPER: %d studs, asked %.0f studs/s at %.1f deg (known cap %.0f, family %s)"):format(math.floor(lastAim.dist), ask, math.deg(ang), cap, Kick.Family))
+	else
+		if typeof(args[7]) == "Vector3" then out[7] = lastAim.rot * args[7] end
+		note = ("Shot at goal  -  %d st"):format(math.floor(lastAim.dist))
+		Log.add("DribbleRelease rotated")
 	end
-	local out = table.clone(args)
 	out[4] = v
-	if typeof(args[7]) == "Vector3" then out[7] = rocket and Vector3.zero or lastAim.rot * args[7] end
 	lastAim.rot = nil
-	if not rocket then Log.add(("DribbleRelease rotated, speed x%.2f"):format(scale)) end
-	if Kick.Notify then
-		Kick.Notify(rocket and ("ROCKET  -  %d st"):format(math.floor(lastAim.dist)) or ("Shot at goal  -  %d st  -  power x%.1f"):format(math.floor(lastAim.dist), scale))
-	end
+	if Kick.Notify then Kick.Notify(note) end
 	return out
 end
 
--- the server tells you when it refuses a release; log it so a too strong boost can be spotted
+-- the server tells you when it refuses a release; log it
 local function watchRejects()
 	if rejectConn then return end
 	pcall(function()
@@ -1860,7 +1858,6 @@ local function watchRejects()
 			if d:IsA("RemoteEvent") and d.Name:find("DribbleReject", 1, true) then
 				rejectConn = d.OnClientEvent:Connect(function(...)
 					Log.add("SERVER REJECTED a dribble / kick call: " .. tostring((...)))
-					if Kick.Notify then Kick.Notify("Server rejected the last kick  -  lower the power boost") end
 				end)
 				break
 			end
@@ -1868,42 +1865,29 @@ local function watchRejects()
 	end)
 end
 
--- after a rocket: what did the ball do? apex, height when it reached the goal distance, and where it came down
-local landing
-function Kick.Landing(dir, want)
-	local ball = World.ball()
-	if not ball then return end
-	local start = ball.Position
-	if landing then landing:Disconnect() end
-	local t0, apex, crossed = os.clock(), start.Y, false
-	landing = game:GetService("RunService").Heartbeat:Connect(function()
-		local dt = os.clock() - t0
-		local b = World.ball()
-		if not b or dt > 10 then
-			if landing then landing:Disconnect(); landing = nil end
-			return
-		end
-		local p = b.Position
-		apex = math.max(apex, p.Y)
-		local along = World.horiz(p - start):Dot(dir)
-		if not crossed and along >= want * 0.98 then
-			crossed = true
-			Log.add(("ROCKET reached the goal distance at %.1fs, height %.1f (apex so far %.0f)"):format(dt, p.Y, apex))
-		end
-		if apex > start.Y + 3 and p.Y < start.Y + 1.5 and dt > 0.4 then
-			Log.add(("ROCKET came down %.0f studs along the aim (wanted %.0f, side %.0f), apex %.0f, after %.1fs"):format(along, want, (World.horiz(p - start) - dir * along).Magnitude, apex, dt))
-			landing:Disconnect(); landing = nil
-		end
-	end)
-end
-
-local flightConn
+-- what the SERVER did with the kick: its KickFlight attribute holds the launch velocity it accepted. That is how the speed cap per family is learned.
+-- format: version | id | t | pos x y z | vel x y z | spin x y z | player | family
 local function watchFlight()
 	local ball = World.ball()
 	if not ball or flightConn then return end
 	flightConn = ball:GetAttributeChangedSignal("KickFlight"):Connect(function()
-		-- what the SERVER decided for the kick (to compare with what we sent)
-		Log.add("server KickFlight: " .. tostring(ball:GetAttribute("KickFlight")):sub(1, 140))
+		local raw = tostring(ball:GetAttribute("KickFlight"))
+		Log.add("server KickFlight: " .. raw:sub(1, 140))
+		if os.clock() - lastSuper.t < 3 then
+			local f = string.split(raw, "|")
+			local vx, vy, vz = tonumber(f[7]), tonumber(f[8]), tonumber(f[9])
+			local fam = f[14]
+			if vx and vy and vz and fam == lastSuper.family then
+				local sp = math.sqrt(vx * vx + vy * vy + vz * vz)
+				local prev = Kick.Cap[fam] or 0
+				if sp > prev or sp < prev * 0.9 then
+					Kick.Cap[fam] = sp
+					Log.add(("learned: %s accepted up to %.0f studs/s"):format(fam, sp))
+					if Kick.Notify then Kick.Notify(("Server accepted %.0f studs/s"):format(sp)) end
+				end
+				lastSuper.t = -99
+			end
+		end
 	end)
 end
 
@@ -1927,7 +1911,6 @@ function Kick.Destroy()
 	Kick.SetAim(false)
 	if rejectConn then rejectConn:Disconnect(); rejectConn = nil end
 	if flightConn then flightConn:Disconnect(); flightConn = nil end
-	if landing then landing:Disconnect(); landing = nil end
 end
 
 return Kick
@@ -2107,12 +2090,9 @@ local key = mBan:Keybind({ Name = "Toggle key", Default = Enum.KeyCode.Z })
 mBan:Section("Your shots")
 mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v; Fun.Corner = v end })
 mBan:Choice({ Name = "Applies to", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
-mBan:Toggle({ Name = "ROCKET: far shots fly up high and drop on the goal", Default = Kick.Rocket, Callback = function(v) Kick.Rocket = v end })
-mBan:Slider({ Name = "Rocket from", Min = 30, Max = 300, Step = 5, Default = Kick.RocketFrom, Suffix = " st", Callback = function(v) Kick.RocketFrom = v end })
-mBan:Choice({ Name = "Rocket style", Options = Kick.Styles, Default = Kick.RocketStyle, Callback = function(v) Kick.RocketStyle = v end })
-mBan:Slider({ Name = "Rocket range tuning", Min = 0.6, Max = 1.6, Step = 0.02, Default = Kick.RocketTune, Suffix = "x", Callback = function(v) Kick.RocketTune = v end })
-mBan:Toggle({ Name = "Power boost (more speed the farther you are)", Default = Kick.Boost, Callback = function(v) Kick.Boost = v end })
-mBan:Slider({ Name = "Max power boost", Min = 1, Max = 4, Step = 0.1, Default = Kick.BoostMax, Suffix = "x", Callback = function(v) Kick.BoostMax = v end })
+mBan:Toggle({ Name = "SUPER SHOT: hardest kick, flattest path to the goal", Default = Kick.Super, Callback = function(v) Kick.Super = v end })
+mBan:Choice({ Name = "Shot type", Options = Kick.Families, Default = Kick.Family, Callback = function(v) Kick.Family = v end })
+mBan:Slider({ Name = "Highest launch angle", Min = 10, Max = 70, Step = 1, Default = Kick.MaxAngle, Suffix = " deg", Callback = function(v) Kick.MaxAngle = v end })
 mBan:Slider({ Name = "Works up to", Min = 40, Max = 500, Step = 10, Default = Kick.MaxDist, Suffix = " st", Callback = function(v) Kick.MaxDist = v end })
 
 mBan:Section("Ball")
