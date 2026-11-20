@@ -52,7 +52,7 @@ mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick
 mBan:Choice({ Name = "Applies to", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
 mBan:Toggle({ Name = "ROCKET: far shots fly up high and drop on the goal", Default = Kick.Rocket, Callback = function(v) Kick.Rocket = v end })
 mBan:Slider({ Name = "Rocket from", Min = 30, Max = 300, Step = 5, Default = Kick.RocketFrom, Suffix = " st", Callback = function(v) Kick.RocketFrom = v end })
-mBan:Slider({ Name = "Rocket height (0 = automatic)", Min = 0, Max = 160, Step = 5, Default = Kick.RocketHeight, Suffix = " st", Callback = function(v) Kick.RocketHeight = v end })
+mBan:Choice({ Name = "Rocket style", Options = Kick.Styles, Default = Kick.RocketStyle, Callback = function(v) Kick.RocketStyle = v end })
 mBan:Slider({ Name = "Rocket range tuning", Min = 0.6, Max = 1.6, Step = 0.02, Default = Kick.RocketTune, Suffix = "x", Callback = function(v) Kick.RocketTune = v end })
 mBan:Toggle({ Name = "Power boost (more speed the farther you are)", Default = Kick.Boost, Callback = function(v) Kick.Boost = v end })
 mBan:Slider({ Name = "Max power boost", Min = 1, Max = 4, Step = 0.1, Default = Kick.BoostMax, Suffix = "x", Callback = function(v) Kick.BoostMax = v end })

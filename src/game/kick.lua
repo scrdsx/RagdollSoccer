@@ -11,10 +11,42 @@ local Log = __import("game/log")
 
 local Kick = {
 	Aim = false, Boost = true, BoostMax = 2.2, AllKicks = true, MaxDist = 400, Corner = "Far from keeper",
-	Rocket = true, RocketFrom = 70, RocketHeight = 0, RocketTune = 1.0,
+	Rocket = true, RocketFrom = 70, RocketStyle = "Missile (fast, flat)", RocketTune = 1.0,
 	Shots = 0, Notify = nil, Info = "off",
 }
 Kick.Corners = { "Far from keeper", "Left post", "Right post", "Centre" }
+
+Kick.ANGLES = { ["Missile (fast, flat)"] = 14, ["Rocket"] = 32, ["Lob (high, slow)"] = 58 }
+Kick.Styles = { "Missile (fast, flat)", "Rocket", "Lob (high, slow)" }
+Kick.MaxSpeed = 320
+
+-- height of the ball when it has travelled `dist` horizontally, launched at speed s and angle ang (quadratic drag, gravity g); -1e9 if it lands before
+local function heightAt(s, ang, dist, y0, g, k)
+	local vx, vy = s * math.cos(ang), s * math.sin(ang)
+	local x, y = 0, y0
+	local dt = 1 / 100
+	for _ = 1, 2000 do
+		local sp = math.sqrt(vx * vx + vy * vy)
+		vx = vx - k * sp * vx * dt
+		vy = vy - (g + k * sp * vy) * dt
+		local nx, ny = x + vx * dt, y + vy * dt
+		if nx >= dist then return y + (ny - y) * ((dist - x) / math.max(nx - x, 1e-6)) end
+		if ny < y0 - 0.3 and vy < 0 then return -1e9 end
+		x, y = nx, ny
+	end
+	return -1e9
+end
+
+-- the smallest speed for which the ball is still at height `yt` when it reaches `dist` (a coming-down crossing)
+function Kick.Solve(dist, ang, y0, yt, g, k)
+	local lo, hi = 4, Kick.MaxSpeed
+	if heightAt(hi, ang, dist, y0, g, k) < yt then return hi end -- cannot get there at this angle: as fast as allowed
+	for _ = 1, 28 do
+		local mid = (lo + hi) / 2
+		if heightAt(mid, ang, dist, y0, g, k) >= yt then hi = mid else lo = mid end
+	end
+	return hi
+end
 
 local lastAim = { rot = nil, dir = nil, dist = 0, t = -99 }
 local rejectConn
@@ -40,6 +72,7 @@ local function onPlan(args)
 	lastAim.rot = CFrame.lookAt(Vector3.zero, newDir) * CFrame.lookAt(Vector3.zero, oldUnit):Inverse()
 	lastAim.dist = toGoal.Magnitude
 	lastAim.dir = newDir
+	lastAim.y = plan.ball.Y
 	lastAim.t = os.clock()
 	Kick.Shots = Kick.Shots + 1
 	Log.add(("KickPlan aimed at goal: %d studs, family %s, power %s"):format(math.floor(toGoal.Magnitude), tostring(plan.family), tostring(plan.power)))
@@ -57,17 +90,18 @@ local function onRelease(args)
 	local scale = 1
 	local rocket = Kick.Rocket and lastAim.dist >= Kick.RocketFrom and lastAim.dir ~= nil
 	if rocket then
-		-- ROCKET: a high arc that comes down on the goal. Ballistic solution with the ball's own gravity (attribute Gravity, 46 in the dump):
-		-- up to height H and down again takes T seconds, so the horizontal speed is distance / T. Spin is dropped so nothing bends the flight.
+		-- ROCKET: the launch speed that makes the ball arrive at the goal. The game's flight model has a quadratic air drag (BallPath: drag = 0.0243 * AirDrag * 0.213)
+		-- and the ball's own gravity (attribute Gravity, 46), so the arrival is solved numerically instead of with the drag-free formula (which fell far short).
 		local ball = World.ball()
 		local g = (ball and tonumber(ball:GetAttribute("Gravity"))) or 46
-		local H = Kick.RocketHeight > 0 and Kick.RocketHeight or math.clamp(lastAim.dist * 0.4, 30, 120)
-		local up = math.sqrt(2 * H / g)
-		local down = math.sqrt(2 * (H + 0.5) / g)
-		local vh = lastAim.dist / (up + down) * Kick.RocketTune
-		v = lastAim.dir * vh + Vector3.new(0, g * up, 0)
-		scale = vh
-		Log.add(("ROCKET: %d studs, apex %d, horizontal %.0f, up %.0f (g %.0f)"):format(math.floor(lastAim.dist), math.floor(H), vh, g * up, g))
+		local air = (ball and tonumber(ball:GetAttribute("AirDrag"))) or 1
+		local k = 0.024366064765727467 * air * 0.213
+		local ang = math.rad(Kick.ANGLES[Kick.RocketStyle] or 16)
+		local y0 = lastAim.y or 1.9
+		local s = Kick.Solve(lastAim.dist * Kick.RocketTune, ang, y0, y0 + 0.9, g, k)
+		v = lastAim.dir * (s * math.cos(ang)) + Vector3.new(0, s * math.sin(ang), 0)
+		scale = s
+		Log.add(("ROCKET %s: %d studs, speed %.0f at %d deg (g %.0f, drag %.4f)"):format(Kick.RocketStyle, math.floor(lastAim.dist), s, math.floor(math.deg(ang)), g, k))
 		Kick.Landing(lastAim.dir, lastAim.dist)
 	elseif Kick.Boost then
 		-- farther goal -> more speed: 1.0x up to about 40 studs, then growing, capped at BoostMax. Height is kept, so the arc stays the same.
@@ -101,24 +135,30 @@ local function watchRejects()
 	end)
 end
 
--- after a rocket: where did the ball come down? (along the aim line, compared with where it should have)
+-- after a rocket: what did the ball do? apex, height when it reached the goal distance, and where it came down
 local landing
 function Kick.Landing(dir, want)
 	local ball = World.ball()
 	if not ball then return end
 	local start = ball.Position
 	if landing then landing:Disconnect() end
-	local t0 = os.clock()
+	local t0, apex, crossed = os.clock(), start.Y, false
 	landing = game:GetService("RunService").Heartbeat:Connect(function()
 		local dt = os.clock() - t0
 		local b = World.ball()
-		if not b or dt > 9 then
+		if not b or dt > 10 then
 			if landing then landing:Disconnect(); landing = nil end
 			return
 		end
-		if dt > 0.8 and b.Position.Y < start.Y + 1.2 then
-			local d = World.horiz(b.Position - start):Dot(dir)
-			Log.add(("ROCKET landed %.0f studs along the aim (wanted %.0f, side %.0f)"):format(d, want, (World.horiz(b.Position - start) - dir * d).Magnitude))
+		local p = b.Position
+		apex = math.max(apex, p.Y)
+		local along = World.horiz(p - start):Dot(dir)
+		if not crossed and along >= want * 0.98 then
+			crossed = true
+			Log.add(("ROCKET reached the goal distance at %.1fs, height %.1f (apex so far %.0f)"):format(dt, p.Y, apex))
+		end
+		if apex > start.Y + 3 and p.Y < start.Y + 1.5 and dt > 0.4 then
+			Log.add(("ROCKET came down %.0f studs along the aim (wanted %.0f, side %.0f), apex %.0f, after %.1fs"):format(along, want, (World.horiz(p - start) - dir * along).Magnitude, apex, dt))
 			landing:Disconnect(); landing = nil
 		end
 	end)
