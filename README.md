@@ -13,15 +13,21 @@ RagdollSoccer/
       world.lua      ball, goals, teams, who has the ball, shot target
       net.lua        the single __namecall hook; modules register handlers per remote
       rules.lua      the game's own rule tables (perfect accuracy, sticky ball)
-      movement.lua   speed boost, always sprint
-      kick.lua       aim rewrite of KickPlan / DribbleRelease, auto shoot through the KickStrike input action
-      bot.lua        "Ronaldini Banini": chase, carry, steer round defenders, shoot
+      speed.lua      speed multiplier (scales the game's Tuning.Speed table)
+      kick.lua       silent goal aim + power boost on your own shots (KickPlan / DribbleRelease)
+      fun.lua        spinbot, moonwalk, sideways, jitter, ball magnet
   tools/game_dump.lua   the dump tool that produced dumps/
   dumps/                the dump of the game (overview + decompiled scripts)
   dist/                 build output
 ```
 
-## Run
+## Run (GitHub)
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/scrdsx/RagdollSoccer/main/loader.lua"))()
+```
+
+## Run (local build)
 
 ```
 python build.py

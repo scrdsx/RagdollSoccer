@@ -107,22 +107,28 @@ function World.opponents(team, from)
 	return oppList, oppKeeper
 end
 
--- where to shoot: a point inside the goal mouth, chosen by `mode`
+-- where to shoot: a point inside the goal mouth, chosen by `mode`. "Far from keeper" aims at the post on the side the keeper is NOT on, close to the post
+-- (the keeper's body is on the other side; a keeper standing in the middle gets the post that is farther from his dive).
 function World.shotTarget(team, ballPos, mode)
 	local attack = World.attackGoal(team)
 	if not attack then return nil end
 	local half = math.max(attack.size.Z, attack.size.X) / 2
-	local off = math.max(half * 0.66, 1)
 	local gz = attack.pos.Z
-	local zs
+	local zs, ratio = 0, 0.7
 	if mode == "Left post" then zs = -1
 	elseif mode == "Right post" then zs = 1
 	elseif mode == "Centre" then zs = 0
 	else
 		local _, keeper = World.opponents(team, ballPos)
-		if keeper then zs = keeper.Z >= gz and -1 or 1 else zs = ballPos.Z >= gz and -1 or 1 end
+		if keeper then
+			local dz = keeper.Z - gz
+			zs = dz >= 0 and -1 or 1
+			ratio = math.clamp(0.62 + math.abs(dz) / math.max(half, 1) * -0.1 + 0.18, 0.6, 0.8) -- a keeper off to one side: aim a little less tight
+		else
+			zs = ballPos.Z >= gz and -1 or 1
+		end
 	end
-	return Vector3.new(attack.pos.X, ballPos.Y, gz + zs * off), attack
+	return Vector3.new(attack.pos.X, ballPos.Y, gz + zs * half * ratio), attack
 end
 
 return World

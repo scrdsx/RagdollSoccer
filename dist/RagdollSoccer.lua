@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.2.0 (bundled by build.py)
+-- Ragdoll Soccer v0.3.0 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.2.0"
+__env.RSVersion = "0.3.0"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -1537,22 +1537,28 @@ function World.opponents(team, from)
 	return oppList, oppKeeper
 end
 
--- where to shoot: a point inside the goal mouth, chosen by `mode`
+-- where to shoot: a point inside the goal mouth, chosen by `mode`. "Far from keeper" aims at the post on the side the keeper is NOT on, close to the post
+-- (the keeper's body is on the other side; a keeper standing in the middle gets the post that is farther from his dive).
 function World.shotTarget(team, ballPos, mode)
 	local attack = World.attackGoal(team)
 	if not attack then return nil end
 	local half = math.max(attack.size.Z, attack.size.X) / 2
-	local off = math.max(half * 0.66, 1)
 	local gz = attack.pos.Z
-	local zs
+	local zs, ratio = 0, 0.7
 	if mode == "Left post" then zs = -1
 	elseif mode == "Right post" then zs = 1
 	elseif mode == "Centre" then zs = 0
 	else
 		local _, keeper = World.opponents(team, ballPos)
-		if keeper then zs = keeper.Z >= gz and -1 or 1 else zs = ballPos.Z >= gz and -1 or 1 end
+		if keeper then
+			local dz = keeper.Z - gz
+			zs = dz >= 0 and -1 or 1
+			ratio = math.clamp(0.62 + math.abs(dz) / math.max(half, 1) * -0.1 + 0.18, 0.6, 0.8) -- a keeper off to one side: aim a little less tight
+		else
+			zs = ballPos.Z >= gz and -1 or 1
+		end
 	end
-	return Vector3.new(attack.pos.X, ballPos.Y, gz + zs * off), attack
+	return Vector3.new(attack.pos.X, ballPos.Y, gz + zs * half * ratio), attack
 end
 
 return World
@@ -1596,51 +1602,6 @@ end
 function Net.Destroy() Net.handlers = {} end
 
 return Net
-
-end
-
-__mods["game/input"] = function()
--- Input: the game's controls are Roblox InputActions (found under PlayerScripts or inside your Mannequin: "Sprint", "KickStrike", ...).
--- Firing an action with true / false is the same as holding / releasing its button.
-local Players = game:GetService("Players")
-local lp = Players.LocalPlayer
-
-local Input = {}
-local cache = {}
-
-local function find(name)
-	local a = cache[name]
-	if a and a.Parent then return a end
-	cache[name] = nil
-	local roots = { lp:FindFirstChild("PlayerScripts"), lp.Character }
-	for _, r in ipairs(roots) do
-		local x = r and r:FindFirstChild(name, true)
-		if x and x:IsA("InputAction") then cache[name] = x; return x end
-	end
-	return nil
-end
-Input.find = find
-
-local held = {}
-function Input.Set(name, on)
-	if held[name] == on then return true end
-	local a = find(name)
-	if not a then return false end
-	local ok = pcall(function() a:Fire(on) end)
-	if ok then held[name] = on end
-	return ok
-end
-
-function Input.Sprint(on) return Input.Set("Sprint", on) end
-
-function Input.Destroy()
-	for name, on in pairs(held) do
-		if on then pcall(function() local a = find(name); if a then a:Fire(false) end end) end
-	end
-	held = {}
-end
-
-return Input
 
 end
 
@@ -1770,29 +1731,27 @@ return Speed
 end
 
 __mods["game/kick"] = function()
--- Kick: silent aim at the goal, and shooting.
---  Aim:   the game computes a kick locally and sends KickPlan (the plan: dir, power, family ...) and then DribbleRelease (ball position, launch velocity, spin ...).
---         The horizontal direction is turned to a point inside the opponent's goal: KickPlan.dir is replaced and the release velocity / spin are rotated by exactly
---         the same angle, so the two still agree with each other.
---  Shoot: the game's own input action "KickStrike" (the kick button) is held for the charge time and released. If no KickPlan follows, the left mouse button
---         (the game binds the kick tool to it as well) is used once as a fallback.
+-- Kick: assist for YOUR shots. You still aim, charge and kick yourself; this changes what is sent to the server.
+--  The game computes a kick locally and sends KickPlan (the plan: dir, power, family ...) and then DribbleRelease (ball position, launch velocity, spin ...).
+--  * Aim:   the horizontal direction is turned to a point inside the opponent's goal (away from the keeper). KickPlan.dir is replaced and the release velocity /
+--           spin are rotated by the same angle, so the two still agree with each other.
+--  * Boost: the horizontal speed of the release is scaled, more for longer distances (a shot from far still arrives, and the keeper gets less time).
 local Players = game:GetService("Players")
-local VIM = game:GetService("VirtualInputManager")
+local RS = game:GetService("ReplicatedStorage")
 local World = __import("game/world")
 local Net = __import("game/net")
-local Input = __import("game/input")
 local Log = __import("game/log")
 
 local Kick = {
-	Aim = false, AllKicks = true, MaxDist = 170, Corner = "Far from keeper", Charge = 0.42,
-	Shots = 0, LastPlan = -99, Notify = nil, Info = "off", Shooting = false,
+	Aim = false, Boost = true, BoostMax = 2.2, AllKicks = true, MaxDist = 400, Corner = "Far from keeper",
+	Shots = 0, Notify = nil, Info = "off",
 }
 Kick.Corners = { "Far from keeper", "Left post", "Right post", "Centre" }
 
-local lastAim = { rot = nil, t = -99 }
+local lastAim = { rot = nil, dist = 0, t = -99 }
+local rejectConn
 
 local function onPlan(args)
-	Kick.LastPlan = os.clock()
 	local plan = args[1]
 	if type(plan) ~= "table" or typeof(plan.dir) ~= "Vector3" or typeof(plan.ball) ~= "Vector3" then return nil end
 	local me = World.me()
@@ -1811,10 +1770,10 @@ local function onPlan(args)
 	local np = table.clone(plan)
 	np.dir = newDir
 	lastAim.rot = CFrame.lookAt(Vector3.zero, newDir) * CFrame.lookAt(Vector3.zero, oldUnit):Inverse()
+	lastAim.dist = toGoal.Magnitude
 	lastAim.t = os.clock()
 	Kick.Shots = Kick.Shots + 1
 	Log.add(("KickPlan aimed at goal: %d studs, family %s, power %s"):format(math.floor(toGoal.Magnitude), tostring(plan.family), tostring(plan.power)))
-	if Kick.Notify then Kick.Notify(("Shot sent at goal (%d studs)"):format(math.floor(toGoal.Magnitude))) end
 	local out = table.clone(args)
 	out[1] = np
 	return out
@@ -1825,17 +1784,36 @@ local function onRelease(args)
 	if not lastAim.rot or os.clock() - lastAim.t > 1.5 then return nil end
 	local vel = args[4]
 	if typeof(vel) ~= "Vector3" then return nil end
+	local v = lastAim.rot * vel
+	local scale = 1
+	if Kick.Boost then
+		-- farther goal -> more speed: 1.0x up to about 40 studs, then growing, capped at BoostMax. Height is kept, so the arc stays the same.
+		scale = math.clamp(0.5 + lastAim.dist / 80, 1, Kick.BoostMax)
+		v = Vector3.new(v.X * scale, v.Y, v.Z * scale)
+	end
 	local out = table.clone(args)
-	out[4] = lastAim.rot * vel
+	out[4] = v
 	if typeof(args[7]) == "Vector3" then out[7] = lastAim.rot * args[7] end
 	lastAim.rot = nil
-	Log.add("DribbleRelease rotated to match")
+	Log.add(("DribbleRelease rotated, speed x%.2f"):format(scale))
+	if Kick.Notify then Kick.Notify(("Shot at goal  -  %d st  -  power x%.1f"):format(math.floor(lastAim.dist), scale)) end
 	return out
 end
 
-local function onClaim(args)
-	Log.add("DribbleClaim sent (ball taken)")
-	return nil
+-- the server tells you when it refuses a release; log it so a too strong boost can be spotted
+local function watchRejects()
+	if rejectConn then return end
+	pcall(function()
+		for _, d in ipairs(RS:GetDescendants()) do
+			if d:IsA("RemoteEvent") and d.Name:find("DribbleReject", 1, true) then
+				rejectConn = d.OnClientEvent:Connect(function(...)
+					Log.add("SERVER REJECTED a dribble / kick call: " .. tostring((...)))
+					if Kick.Notify then Kick.Notify("Server rejected the last kick  -  lower the power boost") end
+				end)
+				break
+			end
+		end
+	end)
 end
 
 function Kick.SetAim(on)
@@ -1844,278 +1822,108 @@ function Kick.SetAim(on)
 		if not Net.Start() then Kick.Info = Net.Error or "hook failed"; Log.add("hook failed: " .. tostring(Net.Error)); return false end
 		Net.On("KickPlan", onPlan)
 		Net.On("DribbleRelease", onRelease)
-		Net.On("DribbleClaim", onClaim)
+		watchRejects()
 		Kick.Info = "aiming"
 	else
-		Net.Off("KickPlan"); Net.Off("DribbleRelease"); Net.Off("DribbleClaim")
+		Net.Off("KickPlan"); Net.Off("DribbleRelease")
 		Kick.Info = "off"
 	end
 	return true
 end
 
--- SHOOT ---------------------------------------------------------------------------------------------------------------------------
-local function mouseKick(hold)
-	local cam = workspace.CurrentCamera
-	local vs = cam and cam.ViewportSize or Vector2.new(960, 540)
-	pcall(function() VIM:SendMouseButtonEvent(vs.X / 2, vs.Y / 2, 0, true, game, 0) end)
-	task.wait(hold)
-	pcall(function() VIM:SendMouseButtonEvent(vs.X / 2, vs.Y / 2, 0, false, game, 0) end)
-end
-
-function Kick.Shoot()
-	if Kick.Shooting then return false end
-	Kick.Shooting = true
-	task.spawn(function()
-		local before = Kick.LastPlan
-		local pressed = Input.Set("KickStrike", true)
-		if pressed then
-			task.wait(Kick.Charge)
-			Input.Set("KickStrike", false)
-		else
-			mouseKick(Kick.Charge)
-		end
-		task.wait(0.55)
-		if Kick.LastPlan == before then
-			-- the button did nothing: try the mouse once
-			Log.add("shoot: no KickPlan after the button, trying the mouse")
-			mouseKick(Kick.Charge)
-		end
-		task.wait(0.3)
-		Kick.Shooting = false
-	end)
-	return true
-end
-
 function Kick.Destroy()
 	Kick.SetAim(false)
-	Input.Set("KickStrike", false)
+	if rejectConn then rejectConn:Disconnect(); rejectConn = nil end
 end
 
 return Kick
 
 end
 
-__mods["game/bot"] = function()
--- Bot ("Ronaldini Banini"): one loop that does everything, before every physics step (so our values are the ones the controller uses).
---   AUTO PLAY   ball free / opponent has it -> run to the ball, approaching from behind (so you run THROUGH it towards the goal and the game picks it up)
---               team mate has it            -> support run
---               you have it                 -> carry it at the goal, steering round defenders
---   AUTO SHOOT  (auto play or manual) when you have the ball, or it is loose at your feet, and you are inside the shooting distance: press the kick button;
---               kick.lua turns the shot to the goal.
---   FUN         spinbot (your character spins), teleport to the loose ball (blatant, the server may not like it)
-local Players = game:GetService("Players")
+__mods["game/fun"] = function()
+-- Fun: silly mechanics for your own player. All of it only drives your own ControllerManager (FacingDirection) / Root, before every physics step.
+--   Spinbot    your player spins on the spot while you play (the kick still goes where the aim assist sends it)
+--   Moonwalk   you face away from where you run
+--   Sideways   you run sideways (face 90 degrees off your direction)
+--   Jitter     your player shakes: other people see you vibrate around your real spot
+--   Ball magnet  teleport behind a loose ball that is within range (blatant)
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
-local lp = Players.LocalPlayer
 local World = __import("game/world")
-local Kick = __import("game/kick")
-local Input = __import("game/input")
 local Log = __import("game/log")
 
-local Bot = {
-	Enabled = false, Auto = true, AutoShoot = true, ShootDist = 34, Dodge = true, Sprint = true, PauseOnKeys = true, ChaseRange = 700,
-	Spin = false, SpinRate = 720, TP = false, TPRange = 70,
-	Status = "off",
+local Fun = {
+	Spin = false, SpinRate = 900, Moonwalk = false, Sideways = false, Jitter = false, JitterSize = 1.6, Magnet = false, MagnetRange = 60,
 }
 
-local conn, gui, pillText
-local lastShot, lastTP, pauseUntil, spinAngle, lastStatus = -99, -99, 0, 0, ""
-local WASD = { Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right }
-
-local function guiParent()
-	local ok, h = pcall(function() return gethui and gethui() end)
-	if ok and h then return h end
-	ok, h = pcall(function() return game:GetService("CoreGui") end)
-	if ok and h then return h end
-	return lp:WaitForChild("PlayerGui")
-end
-
-local function pill()
-	if gui then return end
-	gui = Instance.new("ScreenGui")
-	gui.Name = tostring(math.random(1e6, 9e6)); gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true; gui.DisplayOrder = 5; gui.Enabled = false; gui.Parent = guiParent()
-	local f = Instance.new("Frame")
-	f.AnchorPoint = Vector2.new(.5, 0); f.Position = UDim2.new(.5, 0, 0, 16); f.Size = UDim2.fromOffset(0, 32); f.AutomaticSize = Enum.AutomaticSize.X
-	f.BackgroundColor3 = Color3.fromRGB(21, 21, 24); f.BackgroundTransparency = 0.08; f.BorderSizePixel = 0; f.Parent = gui
-	Instance.new("UICorner", f).CornerRadius = UDim.new(1, 0)
-	local st = Instance.new("UIStroke"); st.Color = Color3.fromRGB(52, 52, 58); st.Parent = f
-	local pd = Instance.new("UIPadding"); pd.PaddingLeft = UDim.new(0, 16); pd.PaddingRight = UDim.new(0, 16); pd.Parent = f
-	pillText = Instance.new("TextLabel")
-	pillText.BackgroundTransparency = 1; pillText.Size = UDim2.fromOffset(0, 32); pillText.AutomaticSize = Enum.AutomaticSize.X
-	pillText.Font = Enum.Font.BuilderSansBold; pillText.TextSize = 14; pillText.TextColor3 = Color3.fromRGB(240, 240, 245); pillText.Text = ""; pillText.Parent = f
-end
-
-local function status(s)
-	if s == Bot.Status then return end
-	Bot.Status = s
-	if pillText then pillText.Text = "Ronaldini  -  " .. s end
-	-- the label changes a lot with distances; only the kind of state goes to the log
-	local kind = s:match("^[%a ]+")
-	if kind ~= lastStatus then lastStatus = kind; Log.add("state: " .. s) end
-end
-
-local function keysDown()
-	for _, k in ipairs(WASD) do
-		if UIS:IsKeyDown(k) then return true end
-	end
-	return false
-end
-
--- steer away from opponents standing close to the path
-local function steer(dir, pos, opps)
-	if not Bot.Dodge then return dir end
-	local push = Vector3.zero
-	for _, o in ipairs(opps) do
-		if o.d > 14 then break end
-		local away = World.horiz(pos - o.pos)
-		if away.Magnitude > 0.01 and World.horiz(o.pos - pos).Unit:Dot(dir) > 0.15 then
-			local side = away.Unit - dir * away.Unit:Dot(dir)
-			push = push + side * ((14 - o.d) / 14) * 1.6
-		end
-	end
-	local out = dir + push
-	return out.Magnitude < 0.01 and dir or out.Unit
-end
-
-local function drive(me, dir)
-	local d = World.horiz(dir)
-	if d.Magnitude < 0.01 then return end
-	d = d.Unit
-	pcall(function()
-		me.cm.MovingDirection = d
-		me.cm.FacingDirection = d
-	end)
-end
+local conn
+local spinAngle, lastMagnet, jitterFlip = 0, -99, 1
 
 local function step(dt)
-	if not Bot.Enabled then return end
+	if not (Fun.Spin or Fun.Moonwalk or Fun.Sideways or Fun.Jitter or Fun.Magnet) then return end
 	local me = World.me()
-	local ball = World.ball()
-	if not me or not me.cm or not ball then status("waiting"); return end
-	if me.state ~= nil and me.state ~= "Animated" then status("down"); return end
-	local pos = me.root.Position
-	local bp = ball.Position
-	local poss = World.possession(ball, me)
-	local dBall = World.horiz(bp - pos).Magnitude
-	local keeper = me.role == "Goalkeeper"
-	local target = World.shotTarget(me.team, bp, Kick.Corner)
+	if not me or not me.cm then return end
+	if me.state ~= nil and me.state ~= "Animated" then return end
+	local cm, root = me.cm, me.root
+	local move = World.horiz(cm.MovingDirection)
 
-	-- AUTO SHOOT (both modes)
-	if Bot.AutoShoot and target and not keeper and not Kick.Shooting and os.clock() - lastShot > 1.2 then
-		local dGoal = World.horiz(target - pos).Magnitude
-		local mine = poss == "me" or (poss == "free" and dBall < 5.5)
-		if mine and dGoal <= Bot.ShootDist then
-			Log.add(("shoot: %d studs from goal, ball %s"):format(math.floor(dGoal), poss))
-			status("SHOOTING")
-			if Kick.Shoot() then lastShot = os.clock() end
-			if Bot.Auto then drive(me, World.horiz(target - pos)) end -- keep facing the goal while it charges
-			return
+	-- facing games (one wins, in this order)
+	if Fun.Spin then
+		spinAngle = (spinAngle + math.rad(Fun.SpinRate) * dt) % (math.pi * 2)
+		pcall(function() cm.FacingDirection = Vector3.new(math.cos(spinAngle), 0, math.sin(spinAngle)) end)
+	elseif move.Magnitude > 0.1 then
+		if Fun.Moonwalk then
+			pcall(function() cm.FacingDirection = -move.Unit end)
+		elseif Fun.Sideways then
+			local d = move.Unit
+			pcall(function() cm.FacingDirection = Vector3.new(-d.Z, 0, d.X) end)
 		end
 	end
 
-	-- AUTO PLAY
-	local busy = Kick.Shooting
-	if Bot.Auto and not keeper and not busy then
-		if Bot.PauseOnKeys and keysDown() then pauseUntil = os.clock() + 0.35 end
-		if os.clock() < pauseUntil then
-			status("you are driving")
-		else
-			if Bot.Sprint then Input.Sprint(true) end
-			local opps = World.opponents(me.team, pos)
-			local goalDir = target and World.horiz(target - bp)
-			if goalDir and goalDir.Magnitude > 0.01 then goalDir = goalDir.Unit else goalDir = nil end
-			if poss == "me" then
-				if target then
-					status(("carrying  -  goal %d st"):format(math.floor(World.horiz(target - pos).Magnitude)))
-					drive(me, steer(World.horiz(target - pos).Unit, pos, opps))
-				end
-			else
-				local mate = false
-				if poss == "other" then
-					local p = ball:GetAttribute("Possessor")
-					for _, pl in ipairs(Players:GetPlayers()) do
-						local c = pl.Character
-						if c and pl ~= lp and c:GetAttribute("DribbleId") == p then mate = c:GetAttribute("Team") == me.team end
-					end
-				end
-				if mate then
-					if goalDir then
-						local spot = bp + goalDir * math.min(World.horiz(target - bp).Magnitude * 0.5, 26)
-						local d = World.horiz(spot - pos)
-						if d.Magnitude > 4 then status("support run"); drive(me, steer(d.Unit, pos, opps)) else status("in position") end
-					end
-				elseif dBall <= Bot.ChaseRange then
-					-- head for where the ball will be; from behind it (relative to the goal) and then through it
-					local bv = World.horiz(ball.AssemblyLinearVelocity)
-					local lead = math.clamp(dBall / math.max(me.cm.BaseMoveSpeed, 8), 0, 0.7)
-					local aim = bp + bv * lead
-					if goalDir then
-						if dBall > 7 then aim = aim - goalDir * 2.4 else aim = aim + goalDir * 4 end
-					end
-					status(("%s  -  %d st"):format(poss == "other" and "pressing" or "chasing the ball", math.floor(dBall)))
-					drive(me, World.horiz(aim - pos))
-				else
-					status("ball too far")
-				end
+	-- jitter: tiny sideways offsets every frame, alternating, so everybody else sees a vibrating player
+	if Fun.Jitter then
+		jitterFlip = -jitterFlip
+		local side = root.CFrame.RightVector
+		pcall(function() root.CFrame = root.CFrame + side * (Fun.JitterSize * 0.12 * jitterFlip) end)
+	end
+
+	-- ball magnet
+	if Fun.Magnet and os.clock() - lastMagnet > 0.6 and me.role ~= "Goalkeeper" then
+		local ball = World.ball()
+		if ball and World.possession(ball, me) == "free" then
+			local pos, bp = root.Position, ball.Position
+			local d = World.horiz(bp - pos).Magnitude
+			if d > 6 and d <= Fun.MagnetRange then
+				lastMagnet = os.clock()
+				local target = World.shotTarget(me.team, bp, "Centre")
+				local back = target and World.horiz(target - bp).Unit * -2.2 or Vector3.zero
+				local np = Vector3.new(bp.X + back.X, pos.Y, bp.Z + back.Z)
+				pcall(function()
+					root.CFrame = CFrame.new(np, np - (back.Magnitude > 0 and back or Vector3.new(0, 0, 1)))
+					root.AssemblyLinearVelocity = Vector3.zero
+				end)
+				Log.add(("magnet: teleported to the ball (%d studs)"):format(math.floor(d)))
 			end
 		end
-	elseif keeper then
-		status("keeper - idle")
-	end
-
-	-- FUN
-	if Bot.TP and poss == "free" and dBall > 6 and dBall <= Bot.TPRange and os.clock() - lastTP > 0.6 and not keeper then
-		lastTP = os.clock()
-		local behind = target and (World.horiz(target - bp).Unit * -2.2) or Vector3.zero
-		local np = Vector3.new(bp.X + behind.X, pos.Y, bp.Z + behind.Z)
-		pcall(function()
-			me.root.CFrame = CFrame.new(np, np + (behind.Magnitude > 0 and -behind or Vector3.new(0, 0, -1)))
-			me.root.AssemblyLinearVelocity = Vector3.zero
-		end)
-		Log.add(("teleported to the ball (%d studs)"):format(math.floor(dBall)))
-	end
-	if Bot.Spin and not Kick.Shooting then
-		spinAngle = (spinAngle + math.rad(Bot.SpinRate) * dt) % (math.pi * 2)
-		pcall(function() me.cm.FacingDirection = Vector3.new(math.cos(spinAngle), 0, math.sin(spinAngle)) end)
 	end
 end
 
-function Bot.SetEnabled(on)
-	Bot.Enabled = on
-	pill()
-	gui.Enabled = on
-	if on then
-		status("starting")
-	else
-		Input.Sprint(false)
-		local me = World.me()
-		if me and me.cm then pcall(function() me.cm.MovingDirection = Vector3.zero end) end
-		status("off")
-	end
-end
-
-function Bot.Start()
+function Fun.Start()
 	if conn then return end
-	pill()
-	-- PreSimulation runs after the game's own input scripts and right before the physics step
-	conn = RunService.PreSimulation:Connect(function(dt)
-		local ok, err = pcall(step, dt)
-		if not ok and Bot.Status ~= "error" then Bot.Status = "error"; Log.add("bot error: " .. tostring(err)); warn("[RagdollSoccer] bot: " .. tostring(err)) end
-	end)
+	conn = RunService.PreSimulation:Connect(function(dt) pcall(step, dt) end)
 end
 
-function Bot.Destroy()
-	Bot.Enabled = false
+function Fun.Destroy()
 	if conn then conn:Disconnect(); conn = nil end
-	if gui then pcall(function() gui:Destroy() end); gui = nil end
+	Fun.Spin, Fun.Moonwalk, Fun.Sideways, Fun.Jitter, Fun.Magnet = false, false, false, false, false
 end
 
-return Bot
+return Fun
 
 end
 
 -- main
--- Ragdoll Soccer: entry point. One window, one module (Ronaldini) with everything inside its settings, and a small Settings tab.
+-- Ragdoll Soccer: entry point. One window, one module (Ronaldini Banini) with everything inside its settings, and a small Settings tab.
+-- Ronaldini is an ASSISTER: you move, aim, charge and kick yourself; it fixes the shot (goal, power, accuracy), keeps the ball with you and adds silly mechanics.
 local UIS = game:GetService("UserInputService")
 local UI = __import("lib/ui")
 local Sfx = __import("lib/sfx")
@@ -2124,9 +1932,8 @@ local Log = __import("game/log")
 local Net = __import("game/net")
 local Rules = __import("game/rules")
 local Speed = __import("game/speed")
-local Input = __import("game/input")
 local Kick = __import("game/kick")
-local Bot = __import("game/bot")
+local Fun = __import("game/fun")
 
 local env = getgenv and getgenv() or _G
 local VERSION = tostring(env.RSVersion or "dev")
@@ -2143,16 +1950,20 @@ Kick.Notify = function(msg) win:Notify(msg, 2) end
 
 -- RONALDINI ---------------------------------------------------------------------------------------------------------------
 local tMain = win:Tab("Ronaldini", { Section = "Play", Icon = 13 })
-local speedMult = 1.0
-local sticky, accurate = true, true
+local speedMult, sticky, accurate = 1.0, true, true
+local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false }
 local mBan
 
+local function applyFun(on)
+	for k, v in pairs(funState) do Fun[k] = on and v end
+end
+
 local function apply(on)
-	Bot.SetEnabled(on)
 	Kick.SetAim(on)
 	Rules.SetAccurate(on and accurate)
 	Rules.SetSticky(on and sticky)
 	Speed.Set(on and speedMult or 1)
+	applyFun(on)
 	win:Notify(on and "Ronaldini Banini ON" or "Ronaldini Banini off", 2)
 	Log.add(on and "Ronaldini ON" or "Ronaldini off")
 end
@@ -2160,20 +1971,12 @@ end
 mBan = tMain:Module({ Name = "Ronaldini Banini", Default = false, Callback = apply })
 local key = mBan:Keybind({ Name = "Toggle key", Default = Enum.KeyCode.Z })
 
-mBan:Section("Mode")
-mBan:Choice({ Name = "Play", Options = { "Auto play", "Manual (I move)" }, Default = "Auto play", Callback = function(v) Bot.Auto = v == "Auto play" end })
-mBan:Toggle({ Name = "Sprint the whole time", Default = Bot.Sprint, Callback = function(v) Bot.Sprint = v end })
-mBan:Toggle({ Name = "Steer round defenders", Default = Bot.Dodge, Callback = function(v) Bot.Dodge = v end })
-mBan:Toggle({ Name = "Hand control back when I press WASD", Default = Bot.PauseOnKeys, Callback = function(v) Bot.PauseOnKeys = v end })
-mBan:Slider({ Name = "Chase the ball up to", Min = 50, Max = 800, Step = 10, Default = Bot.ChaseRange, Suffix = " st", Callback = function(v) Bot.ChaseRange = v end })
-
-mBan:Section("Shooting (silent aim)")
+mBan:Section("Your shots")
 mBan:Choice({ Name = "Where in the goal", Options = Kick.Corners, Default = Kick.Corner, Callback = function(v) Kick.Corner = v end })
-mBan:Choice({ Name = "Aim", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
-mBan:Toggle({ Name = "Shoot by itself near the goal", Default = Bot.AutoShoot, Callback = function(v) Bot.AutoShoot = v end })
-mBan:Slider({ Name = "Shoot from", Min = 12, Max = 90, Step = 1, Default = Bot.ShootDist, Suffix = " st", Callback = function(v) Bot.ShootDist = v end })
-mBan:Slider({ Name = "Charge time", Min = 0.1, Max = 0.5, Step = 0.02, Default = Kick.Charge, Suffix = " s", Callback = function(v) Kick.Charge = v end })
-mBan:Slider({ Name = "Max distance to the goal", Min = 30, Max = 250, Step = 5, Default = Kick.MaxDist, Suffix = " st", Callback = function(v) Kick.MaxDist = v end })
+mBan:Choice({ Name = "Applies to", Options = { "All kicks", "Shots only" }, Default = "All kicks", Callback = function(v) Kick.AllKicks = v == "All kicks" end })
+mBan:Toggle({ Name = "Power boost (more speed the farther you are)", Default = Kick.Boost, Callback = function(v) Kick.Boost = v end })
+mBan:Slider({ Name = "Max power boost", Min = 1, Max = 4, Step = 0.1, Default = Kick.BoostMax, Suffix = "x", Callback = function(v) Kick.BoostMax = v end })
+mBan:Slider({ Name = "Works up to", Min = 40, Max = 500, Step = 10, Default = Kick.MaxDist, Suffix = " st", Callback = function(v) Kick.MaxDist = v end })
 
 mBan:Section("Ball")
 mBan:Toggle({ Name = "Perfect accuracy", Default = true, Callback = function(v) accurate = v; if mBan:Get() then Rules.SetAccurate(v) end end })
@@ -2184,11 +1987,17 @@ mBan:Section("Speed")
 mBan:Slider({ Name = "Speed multiplier", Min = 1, Max = 3, Step = 0.05, Default = speedMult, Suffix = "x", Callback = function(v) speedMult = v; if mBan:Get() then Speed.Set(v) end end })
 
 mBan:Section("Funny")
-mBan:Toggle({ Name = "Spinbot", Default = false, Callback = function(v) Bot.Spin = v end })
-mBan:Slider({ Name = "Spin speed", Min = 90, Max = 2400, Step = 30, Default = Bot.SpinRate, Suffix = " deg/s", Callback = function(v) Bot.SpinRate = v end })
-mBan:Toggle({ Name = "Teleport to the ball (blatant)", Default = false, Callback = function(v) Bot.TP = v end })
-mBan:Slider({ Name = "Teleport range", Min = 15, Max = 200, Step = 5, Default = Bot.TPRange, Suffix = " st", Callback = function(v) Bot.TPRange = v end })
-tMain:Button({ Name = "Shoot now", NoSave = true, Callback = function() Kick.Shoot() end })
+local function fun(name, label)
+	mBan:Toggle({ Name = label, Default = false, Callback = function(v) funState[name] = v; if mBan:Get() then Fun[name] = v end end })
+end
+fun("Spin", "Spinbot")
+mBan:Slider({ Name = "Spin speed", Min = 90, Max = 3000, Step = 30, Default = Fun.SpinRate, Suffix = " deg/s", Callback = function(v) Fun.SpinRate = v end })
+fun("Moonwalk", "Moonwalk (face away from where you run)")
+fun("Sideways", "Run sideways")
+fun("Jitter", "Jitter (others see you vibrate)")
+mBan:Slider({ Name = "Jitter size", Min = 0.5, Max = 6, Step = 0.1, Default = Fun.JitterSize, Suffix = " st", Callback = function(v) Fun.JitterSize = v end })
+fun("Magnet", "Teleport to the loose ball (blatant)")
+mBan:Slider({ Name = "Teleport range", Min = 15, Max = 200, Step = 5, Default = Fun.MagnetRange, Suffix = " st", Callback = function(v) Fun.MagnetRange = v end })
 
 -- SETTINGS ---------------------------------------------------------------------------------------------------------------------
 local tSet = win:Tab("Settings", { Section = "Client", Icon = 9 })
@@ -2219,14 +2028,14 @@ local function save() if Config.Available then pcall(function() Config.Write("de
 local function unload()
 	pcall(save)
 	alive = false
-	Bot.Destroy(); Kick.Destroy(); Rules.Destroy(); Speed.Destroy(); Input.Destroy(); Net.Destroy(); Log.Destroy()
+	Fun.Destroy(); Kick.Destroy(); Rules.Destroy(); Speed.Destroy(); Net.Destroy(); Log.Destroy()
 	win:Destroy()
 	env.__RagdollSoccer = nil
 end
 tSet:Button({ Name = "Unload", NoSave = true, Callback = unload })
 env.__RagdollSoccer = unload
 
-Bot.Start()
+Fun.Start()
 
 if Config.Available then
 	local data = Config.Read("default")
@@ -2245,4 +2054,4 @@ table.insert(win.conns, UIS.InputBegan:Connect(function(i)
 	if key:Get() == i.KeyCode then mBan:Set(not mBan:Get()) end
 end))
 
-win:Notify("Ragdoll Soccer loaded  -  press Z to start Ronaldini", 4, "success")
+win:Notify("Ragdoll Soccer loaded  -  press Z to turn Ronaldini on", 4, "success")

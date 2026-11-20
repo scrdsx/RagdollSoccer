@@ -15,7 +15,7 @@ WORKSPACE = Path.home() / "AppData" / "Local" / "athena" / "workspace" / "Ragdol
 # dependencies first; src/main.lua runs last
 ORDER = [
     "lib/logo", "lib/icons", "lib/sfx", "lib/ui", "lib/config",
-    "game/log", "game/world", "game/net", "game/input", "game/rules", "game/speed", "game/kick", "game/bot",
+    "game/log", "game/world", "game/net", "game/rules", "game/speed", "game/kick", "game/fun",
 ]
 
 version = (root / "VERSION").read_text(encoding="utf8").strip()
