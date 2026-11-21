@@ -10,6 +10,7 @@ local Rules = __import("game/rules")
 local Speed = __import("game/speed")
 local Kick = __import("game/kick")
 local Fun = __import("game/fun")
+local Keeper = __import("game/keeper")
 
 local env = getgenv and getgenv() or _G
 local VERSION = tostring(env.RSVersion or "dev")
@@ -78,6 +79,23 @@ mBan:Slider({ Name = "Jitter size", Min = 0.5, Max = 6, Step = 0.1, Default = Fu
 fun("Magnet", "Teleport to the loose ball (blatant)")
 mBan:Slider({ Name = "Teleport range", Min = 15, Max = 200, Step = 5, Default = Fun.MagnetRange, Suffix = " st", Callback = function(v) Fun.MagnetRange = v end })
 
+-- KEEPER -----------------------------------------------------------------------------------------------------------------------
+local mKeep = tMain:Module({ Name = "Keeper Banini", Default = false, Callback = function(on)
+	Keeper.Set(on)
+	win:Notify(on and "Keeper Banini ON  -  works while you are the goalkeeper" or "Keeper Banini off", 2)
+	Log.add(on and "Keeper ON" or "Keeper off")
+end })
+local keeperKey = mKeep:Keybind({ Name = "Toggle key", Default = Enum.KeyCode.V })
+mKeep:Section("Goal line")
+mKeep:Toggle({ Name = "Goal-line lock (slides you to the best spot)", Default = true, Callback = function(v) Keeper.Lock = v end })
+mKeep:Slider({ Name = "Stand off the line", Min = 2, Max = 16, Step = 0.5, Default = Keeper.Out, Suffix = " st", Callback = function(v) Keeper.Out = v end })
+mKeep:Slider({ Name = "Slide speed", Min = 15, Max = 120, Step = 1, Default = Keeper.Speed, Suffix = " st/s", Callback = function(v) Keeper.Speed = v end })
+mKeep:Toggle({ Name = "Face the ball", Default = true, Callback = function(v) Keeper.FaceBall = v end })
+mKeep:Section("Dives")
+mKeep:Toggle({ Name = "Auto dive at shots", Default = true, Callback = function(v) Keeper.Dive = v end })
+mKeep:Slider({ Name = "Dive this early", Min = 0.2, Max = 1.2, Step = 0.05, Default = Keeper.Reaction, Suffix = " s", Callback = function(v) Keeper.Reaction = v end })
+mKeep:Toggle({ Name = "Smother shots straight at you", Default = true, Callback = function(v) Keeper.Smother = v end })
+
 -- SETTINGS ---------------------------------------------------------------------------------------------------------------------
 local tSet = win:Tab("Settings", { Section = "Client", Icon = 9 })
 tSet:Section("Window")
@@ -107,7 +125,7 @@ local function save() if Config.Available then pcall(function() Config.Write("de
 local function unload()
 	pcall(save)
 	alive = false
-	Fun.Destroy(); Kick.Destroy(); Rules.Destroy(); Speed.Destroy(); Net.Destroy(); Log.Destroy()
+	Fun.Destroy(); Keeper.Destroy(); Kick.Destroy(); Rules.Destroy(); Speed.Destroy(); Net.Destroy(); Log.Destroy()
 	win:Destroy()
 	env.__RagdollSoccer = nil
 end
@@ -115,6 +133,7 @@ tSet:Button({ Name = "Unload", NoSave = true, Callback = unload })
 env.__RagdollSoccer = unload
 
 Fun.Start()
+Keeper.Start()
 
 if Config.Available then
 	local data = Config.Read("default")
@@ -129,8 +148,9 @@ end
 
 table.insert(win.conns, UIS.InputBegan:Connect(function(i)
 	if i.KeyCode == Enum.KeyCode.RightShift then win:Toggle(); return end
-	if i.UserInputType ~= Enum.UserInputType.Keyboard or UIS:GetFocusedTextBox() or key:IsListening() then return end
+	if i.UserInputType ~= Enum.UserInputType.Keyboard or UIS:GetFocusedTextBox() or key:IsListening() or keeperKey:IsListening() then return end
 	if key:Get() == i.KeyCode then mBan:Set(not mBan:Get()) end
+	if keeperKey:Get() == i.KeyCode then mKeep:Set(not mKeep:Get()) end
 end))
 
 win:Notify("Ragdoll Soccer loaded  -  press Z to turn Ronaldini on", 4, "success")

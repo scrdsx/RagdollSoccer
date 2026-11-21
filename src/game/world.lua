@@ -80,6 +80,18 @@ function World.attackGoal(team)
 	return nil
 end
 
+-- the goal this team defends; .outward = +1 when it sits at the +X end of the pitch, -1 at the -X end
+function World.ownGoal(team)
+	local attack = World.attackGoal(team)
+	if not attack then return nil end
+	for _, x in ipairs(World.goals()) do
+		if x ~= attack then
+			return { pos = x.pos, size = x.size, outward = x.pos.X >= attack.pos.X and 1 or -1 }
+		end
+	end
+	return nil
+end
+
 -- opponents (nearest first) and the opposing keeper's position; the player scan is cached for 0.15 s
 local oppAt, oppList, oppKeeper, oppTeam = -99, {}, nil, nil
 function World.opponents(team, from)

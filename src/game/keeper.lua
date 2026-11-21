@@ -1,0 +1,202 @@
+-- Keeper: assist for when YOU are the goalkeeper (Role == "Goalkeeper"). Does nothing while you play outfield.
+--  * Goal-line lock: you slide to the best spot between the ball and the middle of the goal (or to the exact spot a shot will cross the line), staying inside the goal width and
+--    a little off the line. You still move yourself; this only adds a correction every frame, faster than a normal run.
+--  * Auto dive: the ball's flight is predicted with the game's drag + gravity; when it is going to cross the goal line inside the posts, the right dive key is pressed at the
+--    right time (Q / E mid, Z / C low, jump + Q / E high, X smother). The game still does the dive itself, so the server sees a normal dive.
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local World = __import("game/world")
+local Log = __import("game/log")
+local lp = Players.LocalPlayer
+
+local Keeper = {
+	Enabled = false, Dive = true, Lock = true, FaceBall = true,
+	Reaction = 0.55,   -- seconds before the ball crosses the line at which the dive is pressed
+	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
+	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
+	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
+	Smother = true, Saves = 0, Info = "off",
+}
+
+local conn
+local vel, lastPos = Vector3.zero, nil
+local lastDive, lastLog = -99, -99
+local actions = {}
+
+local function horiz(v) return Vector3.new(v.X, 0, v.Z) end
+
+-- InputActions are created by the game's input layer under PlayerScripts (one InputContext per group); found by name
+local function action(name)
+	local a = actions[name]
+	if a and a.Parent then return a end
+	local ps = lp:FindFirstChild("PlayerScripts")
+	if not ps then return nil end
+	for _, ctx in ipairs(ps:GetChildren()) do
+		if ctx:IsA("InputContext") then
+			local x = ctx:FindFirstChild(name)
+			if x and x:IsA("InputAction") then actions[name] = x; return x end
+		end
+	end
+	return nil
+end
+
+local function press(name, hold)
+	local a = action(name)
+	if not a then Log.add("keeper: input action not found: " .. name); return false end
+	local ok = pcall(function() a:Fire(true) end)
+	task.delay(hold or 0.12, function() pcall(function() a:Fire(false) end) end)
+	return ok
+end
+
+-- ball velocity: the physics velocity when it has one, otherwise the movement between frames
+local function trackBall(ball, dt)
+	local p = ball.Position
+	local v = ball.AssemblyLinearVelocity
+	if v.Magnitude < 3 and lastPos and dt > 0 then
+		local est = (p - lastPos) / dt
+		if est.Magnitude < 500 then v = vel:Lerp(est, 0.6) end
+	end
+	lastPos = p
+	vel = v
+	return p, v
+end
+
+-- where and when the ball crosses the goal line plane x = goalX (outward = sign of the goal's side). nil if it never gets there within 3 s.
+local function predict(p, v, goalX, outward, g, k)
+	local x, y, z = p.X, p.Y, p.Z
+	local vx, vy, vz = v.X, v.Y, v.Z
+	local dt = 1 / 60
+	for i = 1, 180 do
+		local sp = math.sqrt(vx * vx + vy * vy + vz * vz)
+		vx = vx - k * sp * vx * dt
+		vy = vy - (g + k * sp * vy) * dt
+		vz = vz - k * sp * vz * dt
+		local nx = x + vx * dt
+		if (nx - goalX) * outward >= 0 then
+			local f = ((goalX - x) / math.max(nx - x, 1e-6))
+			f = math.clamp(f, 0, 1)
+			return i * dt, y + vy * dt * f, z + vz * dt * f
+		end
+		x, y, z = nx, y + vy * dt, z + vz * dt
+	end
+	return nil
+end
+
+local function step(dt)
+	if not Keeper.Enabled then return end
+	local me = World.me()
+	if not me or me.role ~= "Goalkeeper" then Keeper.Info = "not in goal"; return end
+	local ball = World.ball()
+	local goal = World.ownGoal(me.team)
+	if not (ball and goal) then Keeper.Info = "no goal found"; return end
+	Keeper.Info = "guarding"
+
+	local bp, bv = trackBall(ball, dt)
+	local root = me.root
+	local half = math.max(goal.size.Z, goal.size.X) / 2
+	local gx, gz = goal.pos.X, goal.pos.Z
+	local outward = goal.outward -- +1 when the goal is on the +X end
+	local g = tonumber(ball:GetAttribute("Gravity")) or 46
+	local air = tonumber(ball:GetAttribute("AirDrag")) or 1
+	local k = 0.024366064765727467 * air * 0.213
+
+	-- is a shot on its way?
+	local threat
+	local toGoal = bv.X * outward -- speed towards the goal line
+	if toGoal > 16 then
+		local t, y, z = predict(bp, bv, gx, outward, g, k)
+		if t and math.abs(z - gz) <= half + 3 and y - root.Position.Y < 12 then threat = { t = t, y = y, z = z } end
+	end
+
+	local hasBall = World.possession(ball, me) == "me"
+	local busy = me.state ~= nil and me.state ~= "Animated"
+
+	-- goal-line lock
+	if Keeper.Lock and not busy and not hasBall then
+		local inward = -outward
+		local tz, depth
+		if threat then
+			tz = math.clamp(threat.z, gz - (half - 1), gz + (half - 1))
+			depth = 2.5
+		else
+			local centre = Vector3.new(gx, root.Position.Y, gz)
+			local dirv = horiz(bp - centre)
+			if dirv.Magnitude < 1 then dirv = Vector3.new(inward, 0, 0) end
+			dirv = dirv.Unit
+			local want = Vector3.new(gx, 0, gz) + dirv * math.min(Keeper.Out, (horiz(bp - centre)).Magnitude * 0.5)
+			tz = math.clamp(want.Z, gz - (half - 1.5), gz + (half - 1.5))
+			depth = math.clamp((want.X - gx) * inward, 1.5, Keeper.Out + 2)
+		end
+		local target = Vector3.new(gx + inward * depth, root.Position.Y, tz)
+		local cur = root.Position
+		local delta = horiz(target - cur)
+		local mag = delta.Magnitude
+		if mag > 0.25 then
+			local sp = Keeper.Speed * (threat and 1.8 or 1)
+			local np = cur + delta.Unit * math.min(mag, sp * dt)
+			local face = root.CFrame - root.CFrame.Position
+			if Keeper.FaceBall then
+				local look = horiz(bp - np)
+				if look.Magnitude > 0.5 then face = CFrame.lookAt(Vector3.zero, look) end
+			end
+			pcall(function() root.CFrame = CFrame.new(np) * face end)
+		end
+	end
+
+	-- auto dive
+	if Keeper.Dive and threat and not busy and not hasBall and threat.t <= Keeper.Reaction and os.clock() - lastDive > 1.1 then
+		local cam = workspace.CurrentCamera
+		local right = cam and horiz(cam.CFrame.RightVector)
+		if right and right.Magnitude > 0.05 then
+			right = right.Unit
+			local cross = Vector3.new(gx, threat.y, threat.z)
+			local rel = horiz(cross - root.Position)
+			local lat = rel:Dot(right)
+			local high = threat.y - root.Position.Y > 3.4
+			local low = threat.y - root.Position.Y < 0.4
+			lastDive = os.clock()
+			if math.abs(lat) < Keeper.MinDive then
+				if Keeper.Smother and not high and rel.Magnitude < 12 then
+					press("Smother")
+					Log.add(("keeper: smother (ball %.1f s away, %.1f off-centre)"):format(threat.t, lat))
+				else
+					lastDive = -99
+				end
+			else
+				local side = lat > 0 and "Right" or "Left"
+				Keeper.Saves = Keeper.Saves + 1
+				if high then
+					press("Jump", 0.35)
+					task.delay(0.04, function() press("Dive" .. side) end)
+				elseif low then
+					press("LowDive" .. side)
+				else
+					press("Dive" .. side)
+				end
+				Log.add(("keeper: dive %s (%s), ball crosses in %.2fs, %.1f studs away, height %.1f"):format(side, high and "high" or low and "low" or "mid", threat.t, lat, threat.y - root.Position.Y))
+			end
+		end
+	end
+
+	if threat and os.clock() - lastLog > 1 then
+		lastLog = os.clock()
+		Log.add(("keeper: shot coming, crosses in %.2fs at z offset %.1f, height %.1f"):format(threat.t, threat.z - gz, threat.y - root.Position.Y))
+	end
+end
+
+function Keeper.Start()
+	if conn then return end
+	conn = RunService.PreSimulation:Connect(function(dt) pcall(step, dt) end)
+end
+
+function Keeper.Set(on)
+	Keeper.Enabled = on
+	if not on then Keeper.Info = "off"; vel, lastPos = Vector3.zero, nil end
+end
+
+function Keeper.Destroy()
+	if conn then conn:Disconnect(); conn = nil end
+	Keeper.Enabled = false
+end
+
+return Keeper
