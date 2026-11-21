@@ -11,7 +11,7 @@ local lp = Players.LocalPlayer
 
 local Keeper = {
 	Enabled = false, Dive = true, Lock = true, FaceBall = true,
-	Reaction = 0.55,   -- seconds before the ball crosses the line at which the dive is pressed
+	Reaction = 0.8,    -- seconds before the ball crosses the line at which the dive is pressed
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
@@ -21,6 +21,7 @@ local Keeper = {
 local conn
 local vel, lastPos = Vector3.zero, nil
 local lastDive, lastLog = -99, -99
+local floorY, loggedGoal = nil, false
 local actions = {}
 
 local function horiz(v) return Vector3.new(v.X, 0, v.Z) end
@@ -62,7 +63,7 @@ local function trackBall(ball, dt)
 end
 
 -- where and when the ball crosses the goal line plane x = goalX (outward = sign of the goal's side). nil if it never gets there within 3 s.
-local function predict(p, v, goalX, outward, g, k)
+local function predict(p, v, goalX, outward, g, k, floor)
 	local x, y, z = p.X, p.Y, p.Z
 	local vx, vy, vz = v.X, v.Y, v.Z
 	local dt = 1 / 60
@@ -78,6 +79,10 @@ local function predict(p, v, goalX, outward, g, k)
 			return i * dt, y + vy * dt * f, z + vz * dt * f
 		end
 		x, y, z = nx, y + vy * dt, z + vz * dt
+		if y < floor then -- ground: the ball bounces a little, then rolls
+			y = floor
+			vy = vy < -6 and -vy * 0.5 or 0
+		end
 	end
 	return nil
 end
@@ -90,8 +95,14 @@ local function step(dt)
 	local goal = World.ownGoal(me.team)
 	if not (ball and goal) then Keeper.Info = "no goal found"; return end
 	Keeper.Info = "guarding"
+	if not loggedGoal then
+		loggedGoal = true
+		Log.add(("keeper: own goal at (%.0f, %.0f) size (%.0f, %.0f, %.0f), outward %d, half width used %.1f"):format(goal.pos.X, goal.pos.Z, goal.size.X, goal.size.Y, goal.size.Z, goal.outward, math.max(goal.size.Z, goal.size.X) / 2))
+	end
 
 	local bp, bv = trackBall(ball, dt)
+	-- ground level for the ball = the lowest it has been seen (it rests there); forgotten slowly in case the pitch differs
+	floorY = floorY and math.min(floorY + dt * 0.05, bp.Y) or bp.Y
 	local root = me.root
 	local half = math.max(goal.size.Z, goal.size.X) / 2
 	local gx, gz = goal.pos.X, goal.pos.Z
@@ -104,8 +115,8 @@ local function step(dt)
 	local threat
 	local toGoal = bv.X * outward -- speed towards the goal line
 	if toGoal > 16 then
-		local t, y, z = predict(bp, bv, gx, outward, g, k)
-		if t and math.abs(z - gz) <= half + 3 and y - root.Position.Y < 12 then threat = { t = t, y = y, z = z } end
+		local t, y, z = predict(bp, bv, gx, outward, g, k, floorY)
+		if t and math.abs(z - gz) <= half + 8 and y - root.Position.Y < 12 then threat = { t = t, y = y, z = z } end
 	end
 
 	local hasBall = World.possession(ball, me) == "me"
@@ -156,7 +167,7 @@ local function step(dt)
 			local low = threat.y - root.Position.Y < 0.4
 			lastDive = os.clock()
 			if math.abs(lat) < Keeper.MinDive then
-				if Keeper.Smother and not high and rel.Magnitude < 12 then
+				if Keeper.Smother and not high and rel.Magnitude < 12 and threat.t <= Keeper.Reaction * 0.6 then
 					press("Smother")
 					Log.add(("keeper: smother (ball %.1f s away, %.1f off-centre)"):format(threat.t, lat))
 				else
