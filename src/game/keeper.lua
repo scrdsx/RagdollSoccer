@@ -15,7 +15,8 @@ local Keeper = {
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
-	Blatant = true, TeleAt = 2.0, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
+	Blatant = true, TeleAt = 0.5, Smother = true, Rush = true, RushRange = 30, Grab = true,
+	Auto = false, AutoChance = 100, ShootRange = 75, Corner = "Far from keeper", Saves = 0, Info = "off",
 }
 
 local conn
@@ -25,6 +26,8 @@ local floorY, loggedGoal = nil, false
 local flight, flightBall, flightConn
 local holdPos, holdUntil, holdLogged = nil, 0, false
 local lastFP, fdVel = nil, Vector3.zero
+local groundY = nil                      -- your normal standing height (so a block never lifts you into the air)
+local autoOn, autoDecided, lastHas, lastKick, sprinting = false, false, -99, -99, false
 
 -- the server's own KickFlight record: exact start position and velocity of every kick, known the moment it happens
 local function hookFlight(ball)
@@ -154,15 +157,62 @@ local function step(dt)
 	local hasBall = possession == "me"
 	local busy = me.state ~= nil and me.state ~= "Animated"
 
-	-- BLATANT: the moment before the ball crosses the line you are simply standing exactly where it arrives. Uses the ball's LIVE movement (it curves), re-aimed every frame.
-	if Keeper.Blatant and not hasBall then
+	if not groundY or (not holdPos and busy == false) then groundY = root.Position.Y end
+
+	-- AUTO PLAY: when YOU (the keeper) get the ball, now and then run it up the pitch, round the players, and shoot at their goal
+	if hasBall then lastHas = os.clock() end
+	if Keeper.Auto and hasBall and not autoDecided then
+		autoDecided = true
+		autoOn = math.random() * 100 < Keeper.AutoChance
+		Log.add("keeper: auto play " .. (autoOn and "STARTS" or "skipped this time"))
+	end
+	if not hasBall and os.clock() - lastHas > 1.0 then
+		autoOn, autoDecided = false, false
+		if sprinting then sprinting = false; local a = action("Sprint"); if a then pcall(function() a:Fire(false) end) end end
+	end
+	if autoOn and Keeper.Auto and hasBall and me.cm then
+		local team = me.team
+		local target = World.shotTarget(team, bp, Keeper.Corner)
+		if target then
+			local pos = root.Position
+			local toT = horiz(target - pos)
+			if toT.Magnitude <= Keeper.ShootRange and os.clock() - lastKick > 1.5 then
+				lastKick = os.clock()
+				pcall(function() me.cm.FacingDirection = toT.Unit end)
+				press("KickStrike", 0.3)
+				Log.add(("keeper: auto shot from %d studs"):format(math.floor(toT.Magnitude)))
+				autoOn = false
+			else
+				local dir = toT.Magnitude > 0.5 and toT.Unit or Vector3.new(-outward, 0, 0)
+				local perp = Vector3.new(-dir.Z, 0, dir.X)
+				local avoid = Vector3.zero
+				for _, o in ipairs((World.opponents(team, pos))) do
+					local d = horiz(o.pos - pos)
+					local m = d.Magnitude
+					if m > 0.1 and m < 22 and d:Dot(dir) > -4 then
+						local w = ((22 - m) / 22) ^ 1.5
+						local side = perp:Dot(d) < 0 and 1 or -1   -- step to the side the player is NOT on
+						avoid = avoid + perp * side * w * 2.4 - d.Unit * w * 1.2
+					end
+				end
+				local mv = dir + avoid
+				mv = mv.Magnitude > 0.05 and mv.Unit or dir
+				pcall(function() me.cm.MovingDirection = mv; me.cm.FacingDirection = mv end)
+				if not sprinting then sprinting = true; local a = action("Sprint"); if a then pcall(function() a:Fire(true) end) end end
+			end
+		end
+		return
+	end
+
+	-- BLATANT: a shot at your goal is met exactly where the ball is going. Uses the ball's LIVE movement (it curves), re-aimed every frame; never lifts you off the ground.
+	if Keeper.Blatant and not hasBall and possession == "free" then
 		local dx = (lineX - bp.X) * outward -- distance left to the line (positive while the ball is in front of it)
 		local vl = fdVel.X * outward
-		if dx > 0 and vl > 25 then
+		if dx > 0 and vl > 35 then
 			local tl = dx / vl
 			if tl <= Keeper.TeleAt then
 				local tz = math.clamp(bp.Z + fdVel.Z * tl, gz - half, gz + half)
-				local ty = math.clamp(bp.Y + fdVel.Y * tl, root.Position.Y, root.Position.Y + 8)
+				local ty = math.clamp(bp.Y + fdVel.Y * tl, groundY, groundY + 2)
 				holdPos = Vector3.new(lineX - outward * 1.6, ty, tz)
 				holdUntil = os.clock() + 0.5
 				if not holdLogged then
@@ -178,6 +228,10 @@ local function step(dt)
 		holding = true
 		local face = Keeper.FaceBall and CFrame.lookAt(Vector3.zero, horiz(bp - holdPos).Magnitude > 0.5 and horiz(bp - holdPos) or Vector3.new(-outward, 0, 0)) or (root.CFrame - root.CFrame.Position)
 		pcall(function() root.CFrame = CFrame.new(holdPos) * face; root.AssemblyLinearVelocity = Vector3.zero end)
+		if Keeper.Smother and horiz(bp - holdPos).Magnitude < 7 and os.clock() - lastDive > 0.8 then
+			lastDive = os.clock()
+			press("Smother")
+		end
 	else
 		holdPos = nil
 		holdLogged = false
@@ -189,8 +243,13 @@ local function step(dt)
 		local inward = -outward
 		local tz, depth
 		local d2goal = horiz(bp - Vector3.new(gx, 0, gz)).Magnitude
-		local rush = Keeper.Rush and possession == "other" and not threat and d2goal < Keeper.RushRange
-		if rush then
+		local grab = Keeper.Grab and possession == "free" and fdVel.Magnitude < 25 and not threat and d2goal < Keeper.RushRange + 10
+		local rush = grab or (Keeper.Rush and possession == "other" and not threat and d2goal < Keeper.RushRange)
+		if grab then
+			-- a loose ball near your goal: go and take it
+			tz = math.clamp(bp.Z, gz - (half - 1.5), gz + (half - 1.5))
+			depth = math.clamp((bp.X - lineX) * inward, 1.5, Keeper.RushRange + 8)
+		elseif rush then
 			-- somebody dribbles at you: come off the line to the ball, on the line ball -> goal centre, to shrink the angle
 			local dirv = horiz(Vector3.new(gx, 0, gz) - bp)
 			dirv = dirv.Magnitude > 0.5 and dirv.Unit or Vector3.new(inward, 0, 0)
@@ -223,7 +282,7 @@ local function step(dt)
 		local delta = horiz(target - cur)
 		local mag = delta.Magnitude
 		if mag > 0.25 then
-			local sp = Keeper.Speed * ((threat or rush) and 1.8 or 1)
+			local sp = Keeper.Speed * (grab and 3.2 or ((threat or rush) and 2.4 or 1))
 			local np = cur + delta.Unit * math.min(mag, sp * dt)
 			local face = root.CFrame - root.CFrame.Position
 			if Keeper.FaceBall then
@@ -288,6 +347,7 @@ end
 function Keeper.Destroy()
 	if flightConn then flightConn:Disconnect(); flightConn = nil end
 	if conn then conn:Disconnect(); conn = nil end
+	if sprinting then local a = action("Sprint"); if a then pcall(function() a:Fire(false) end) end; sprinting = false end
 	Keeper.Enabled = false
 end
 

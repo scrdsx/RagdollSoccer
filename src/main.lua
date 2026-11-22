@@ -29,14 +29,14 @@ Kick.Notify = function(msg) win:Notify(msg, 2) end
 local tMain = win:Tab("Ronaldini", { Section = "Play", Icon = 13 })
 local speedMult, sticky, accurate = 1.0, true, true
 local funState = { Spin = false, Moonwalk = false, Sideways = false, Jitter = false, Magnet = false, RainbowBall = false, AimLine = false }
-local mBan
+local mBan, mKeep
 
 local function applyFun(on)
 	for k, v in pairs(funState) do Fun[k] = on and v end
 end
 
 local function apply(on)
-	Kick.SetAim(on)
+	Kick.SetAim(on or (mKeep ~= nil and mKeep:Get() and Keeper.Auto))
 	Rules.SetAccurate(on and accurate)
 	Rules.SetSticky(on and sticky)
 	Speed.Set(on and speedMult or 1)
@@ -80,8 +80,9 @@ fun("Magnet", "Teleport to the loose ball (blatant)")
 mBan:Slider({ Name = "Teleport range", Min = 15, Max = 200, Step = 5, Default = Fun.MagnetRange, Suffix = " st", Callback = function(v) Fun.MagnetRange = v end })
 
 -- KEEPER -----------------------------------------------------------------------------------------------------------------------
-local mKeep = tMain:Module({ Name = "Keeper Banini", Default = false, Callback = function(on)
+mKeep = tMain:Module({ Name = "Keeper Banini", Default = false, Callback = function(on)
 	Keeper.Set(on)
+	if Keeper.Auto and on then Kick.SetAim(true) end
 	win:Notify(on and "Keeper Banini ON  -  works while you are the goalkeeper" or "Keeper Banini off", 2)
 	Log.add(on and "Keeper ON" or "Keeper off")
 end })
@@ -95,6 +96,11 @@ mKeep:Toggle({ Name = "Rush out at dribblers (shrinks the angle, smothers)", Def
 mKeep:Slider({ Name = "Rush when the ball is within", Min = 10, Max = 60, Step = 1, Default = Keeper.RushRange, Suffix = " st", Callback = function(v) Keeper.RushRange = v end })
 mKeep:Section("Blatant")
 mKeep:Toggle({ Name = "Block shots: stand exactly where the ball goes (as early as possible)", Default = true, Callback = function(v) Keeper.Blatant = v end })
+mKeep:Toggle({ Name = "Grab loose balls near your goal", Default = true, Callback = function(v) Keeper.Grab = v end })
+mKeep:Section("Auto play (when you have the ball)")
+mKeep:Toggle({ Name = "Run it up the pitch round players and score", Default = false, Callback = function(v) Keeper.Auto = v; if v and mKeep:Get() then Kick.SetAim(true) end end })
+mKeep:Slider({ Name = "Chance each time you get the ball", Min = 5, Max = 100, Step = 5, Default = Keeper.AutoChance, Suffix = " %", Callback = function(v) Keeper.AutoChance = v end })
+mKeep:Slider({ Name = "Shoot from", Min = 25, Max = 200, Step = 5, Default = Keeper.ShootRange, Suffix = " st", Callback = function(v) Keeper.ShootRange = v end })
 mKeep:Section("Dives")
 mKeep:Toggle({ Name = "Auto dive at shots", Default = true, Callback = function(v) Keeper.Dive = v end })
 mKeep:Slider({ Name = "Dive this early", Min = 0.2, Max = 1.2, Step = 0.05, Default = Keeper.Reaction, Suffix = " s", Callback = function(v) Keeper.Reaction = v end })
