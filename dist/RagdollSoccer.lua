@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.8.1 (bundled by build.py)
+-- Ragdoll Soccer v0.8.2 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.8.1"
+__env.RSVersion = "0.8.2"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -2208,7 +2208,7 @@ local function step(dt)
 
 	-- BLATANT: the moment before the ball crosses the line you are simply standing exactly where it arrives. Uses the ball's LIVE movement (it curves), re-aimed every frame.
 	if Keeper.Blatant and not hasBall then
-		local dx = (lineX - bp.X) * outward * -1 -- distance left to the line (positive while the ball is in front of it)
+		local dx = (lineX - bp.X) * outward -- distance left to the line (positive while the ball is in front of it)
 		local vl = fdVel.X * outward
 		if dx > 0 and vl > 25 then
 			local tl = dx / vl
