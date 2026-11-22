@@ -23,7 +23,8 @@ local vel, lastPos = Vector3.zero, nil
 local lastDive, lastLog, lastState = -99, -99, -99
 local floorY, loggedGoal = nil, false
 local flight, flightBall, flightConn
-local holdPos, holdUntil = nil, 0
+local holdPos, holdUntil, holdLogged = nil, 0, false
+local lastFP, fdVel = nil, Vector3.zero
 
 -- the server's own KickFlight record: exact start position and velocity of every kick, known the moment it happens
 local function hookFlight(ball)
@@ -116,6 +117,15 @@ local function step(dt)
 	end
 
 	hookFlight(ball)
+	-- live ball velocity from its own movement (smoothed): follows curve / spin, which the flight record alone does not
+	do
+		local pnow = ball.Position
+		if lastFP and dt > 0 then
+			local est = (pnow - lastFP) / dt
+			if est.Magnitude < 600 then fdVel = fdVel:Lerp(est, 0.5) end
+		end
+		lastFP = pnow
+	end
 	local bp, bv = trackBall(ball, dt)
 	-- ground level for the ball = the lowest it has been seen (it rests there); forgotten slowly in case the pitch differs
 	floorY = floorY and math.min(floorY + dt * 0.05, bp.Y) or bp.Y
@@ -144,13 +154,24 @@ local function step(dt)
 	local hasBall = possession == "me"
 	local busy = me.state ~= nil and me.state ~= "Animated"
 
-	-- BLATANT: the moment before the ball crosses the line you are simply standing exactly where it arrives (held for half a second so it hits you)
-	if Keeper.Blatant and threat and not hasBall and threat.t <= Keeper.TeleAt then
-		local tz = math.clamp(threat.z, gz - half, gz + half)
-		holdPos = Vector3.new(lineX - outward * 1.6, math.clamp(threat.y, root.Position.Y, root.Position.Y + 8), tz)
-		holdUntil = os.clock() + 0.5
-		Keeper.Saves = Keeper.Saves + 1
-		Log.add(("keeper: BLOCK at z %.1f height %.1f (ball was %.2fs away)"):format(tz - gz, holdPos.Y - root.Position.Y, threat.t))
+	-- BLATANT: the moment before the ball crosses the line you are simply standing exactly where it arrives. Uses the ball's LIVE movement (it curves), re-aimed every frame.
+	if Keeper.Blatant and not hasBall then
+		local dx = (lineX - bp.X) * outward * -1 -- distance left to the line (positive while the ball is in front of it)
+		local vl = fdVel.X * outward
+		if dx > 0 and vl > 25 then
+			local tl = dx / vl
+			if tl <= Keeper.TeleAt then
+				local tz = math.clamp(bp.Z + fdVel.Z * tl, gz - half, gz + half)
+				local ty = math.clamp(bp.Y + fdVel.Y * tl, root.Position.Y, root.Position.Y + 8)
+				holdPos = Vector3.new(lineX - outward * 1.6, ty, tz)
+				holdUntil = os.clock() + 0.5
+				if not holdLogged then
+					holdLogged = true
+					Keeper.Saves = Keeper.Saves + 1
+					Log.add(("keeper: BLOCK at z %.1f (ball %.2fs away, live speed %.0f)"):format(tz - gz, tl, vl))
+				end
+			end
+		end
 	end
 	local holding = false
 	if holdPos and os.clock() < holdUntil and not hasBall then
@@ -159,6 +180,7 @@ local function step(dt)
 		pcall(function() root.CFrame = CFrame.new(holdPos) * face; root.AssemblyLinearVelocity = Vector3.zero end)
 	else
 		holdPos = nil
+		holdLogged = false
 	end
 	busy = busy or holding
 
@@ -260,7 +282,7 @@ end
 
 function Keeper.Set(on)
 	Keeper.Enabled = on
-	if not on then Keeper.Info = "off"; vel, lastPos = Vector3.zero, nil end
+	if not on then Keeper.Info = "off"; vel, lastPos = Vector3.zero, nil; lastFP, fdVel = nil, Vector3.zero end
 end
 
 function Keeper.Destroy()
