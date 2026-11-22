@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.7.1 (bundled by build.py)
+-- Ragdoll Soccer v0.7.2 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.7.1"
+__env.RSVersion = "0.7.2"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
