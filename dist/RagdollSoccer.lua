@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.8.2 (bundled by build.py)
+-- Ragdoll Soccer v0.8.3 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.8.2"
+__env.RSVersion = "0.8.3"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -2067,7 +2067,7 @@ local Keeper = {
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
-	Blatant = true, TeleAt = 0.18, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
+	Blatant = true, TeleAt = 2.0, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
 }
 
 local conn
@@ -2444,8 +2444,7 @@ mKeep:Toggle({ Name = "Face the ball", Default = true, Callback = function(v) Ke
 mKeep:Toggle({ Name = "Rush out at dribblers (shrinks the angle, smothers)", Default = true, Callback = function(v) Keeper.Rush = v end })
 mKeep:Slider({ Name = "Rush when the ball is within", Min = 10, Max = 60, Step = 1, Default = Keeper.RushRange, Suffix = " st", Callback = function(v) Keeper.RushRange = v end })
 mKeep:Section("Blatant")
-mKeep:Toggle({ Name = "Block shots: appear exactly where the ball arrives", Default = true, Callback = function(v) Keeper.Blatant = v end })
-mKeep:Slider({ Name = "Troll delay (how late you pop in)", Min = 0.05, Max = 0.6, Step = 0.01, Default = Keeper.TeleAt, Suffix = " s", Callback = function(v) Keeper.TeleAt = v end })
+mKeep:Toggle({ Name = "Block shots: stand exactly where the ball goes (as early as possible)", Default = true, Callback = function(v) Keeper.Blatant = v end })
 mKeep:Section("Dives")
 mKeep:Toggle({ Name = "Auto dive at shots", Default = true, Callback = function(v) Keeper.Dive = v end })
 mKeep:Slider({ Name = "Dive this early", Min = 0.2, Max = 1.2, Step = 0.05, Default = Keeper.Reaction, Suffix = " s", Callback = function(v) Keeper.Reaction = v end })

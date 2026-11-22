@@ -15,7 +15,7 @@ local Keeper = {
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
-	Blatant = true, TeleAt = 0.18, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
+	Blatant = true, TeleAt = 2.0, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
 }
 
 local conn
