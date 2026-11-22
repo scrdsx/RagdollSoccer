@@ -91,6 +91,8 @@ mKeep:Toggle({ Name = "Goal-line lock (slides you to the best spot)", Default = 
 mKeep:Slider({ Name = "Stand off the line", Min = 2, Max = 16, Step = 0.5, Default = Keeper.Out, Suffix = " st", Callback = function(v) Keeper.Out = v end })
 mKeep:Slider({ Name = "Slide speed", Min = 15, Max = 120, Step = 1, Default = Keeper.Speed, Suffix = " st/s", Callback = function(v) Keeper.Speed = v end })
 mKeep:Toggle({ Name = "Face the ball", Default = true, Callback = function(v) Keeper.FaceBall = v end })
+mKeep:Toggle({ Name = "Rush out at dribblers (shrinks the angle, smothers)", Default = true, Callback = function(v) Keeper.Rush = v end })
+mKeep:Slider({ Name = "Rush when the ball is within", Min = 10, Max = 60, Step = 1, Default = Keeper.RushRange, Suffix = " st", Callback = function(v) Keeper.RushRange = v end })
 mKeep:Section("Dives")
 mKeep:Toggle({ Name = "Auto dive at shots", Default = true, Callback = function(v) Keeper.Dive = v end })
 mKeep:Slider({ Name = "Dive this early", Min = 0.2, Max = 1.2, Step = 0.05, Default = Keeper.Reaction, Suffix = " s", Callback = function(v) Keeper.Reaction = v end })

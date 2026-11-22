@@ -15,13 +15,26 @@ local Keeper = {
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
-	Smother = true, Saves = 0, Info = "off",
+	Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
 }
 
 local conn
 local vel, lastPos = Vector3.zero, nil
 local lastDive, lastLog = -99, -99
 local floorY, loggedGoal = nil, false
+local flight, flightBall, flightConn
+
+-- the server's own KickFlight record: exact start position and velocity of every kick, known the moment it happens
+local function hookFlight(ball)
+	if flightBall == ball then return end
+	if flightConn then flightConn:Disconnect() end
+	flightBall = ball
+	flightConn = ball:GetAttributeChangedSignal("KickFlight"):Connect(function()
+		local f = string.split(tostring(ball:GetAttribute("KickFlight")), "|")
+		local px, py, pz, vx, vy, vz = tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7]), tonumber(f[8]), tonumber(f[9])
+		if px and pz and vx and vz then flight = { p = Vector3.new(px, py, pz), v = Vector3.new(vx, vy or 0, vz), t0 = os.clock() } end
+	end)
+end
 local actions = {}
 
 local function horiz(v) return Vector3.new(v.X, 0, v.Z) end
@@ -100,6 +113,7 @@ local function step(dt)
 		Log.add(("keeper: own goal at (%.0f, %.0f) size (%.0f, %.0f, %.0f), outward %d, half width used %.1f"):format(goal.pos.X, goal.pos.Z, goal.size.X, goal.size.Y, goal.size.Z, goal.outward, math.max(goal.size.Z, goal.size.X) / 2))
 	end
 
+	hookFlight(ball)
 	local bp, bv = trackBall(ball, dt)
 	-- ground level for the ball = the lowest it has been seen (it rests there); forgotten slowly in case the pitch differs
 	floorY = floorY and math.min(floorY + dt * 0.05, bp.Y) or bp.Y
@@ -112,21 +126,41 @@ local function step(dt)
 	local k = 0.024366064765727467 * air * 0.213
 
 	-- is a shot on its way?
+	local lineX = gx - outward * math.max(goal.size.X / 2 - 1, 0) -- the front of the goal, where the ball counts as in
+	local possession = World.possession(ball, me)
 	local threat
-	local toGoal = bv.X * outward -- speed towards the goal line
-	if toGoal > 16 then
-		local t, y, z = predict(bp, bv, gx, outward, g, k, floorY)
-		if t and math.abs(z - gz) <= half + 8 and y - root.Position.Y < 12 then threat = { t = t, y = y, z = z } end
+	local p0, v0, elapsed = bp, bv, 0
+	if flight and possession == "free" and os.clock() - flight.t0 < 3 then p0, v0, elapsed = flight.p, flight.v, os.clock() - flight.t0 end
+	if v0.X * outward > 16 then
+		local t, y, z = predict(p0, v0, lineX, outward, g, k, floorY)
+		if t then
+			t = t - elapsed
+			if t > -0.08 and math.abs(z - gz) <= half + 4 and y - root.Position.Y < 12 then threat = { t = math.max(t, 0), y = y, z = z } end
+		end
 	end
 
-	local hasBall = World.possession(ball, me) == "me"
+	local hasBall = possession == "me"
 	local busy = me.state ~= nil and me.state ~= "Animated"
 
 	-- goal-line lock
 	if Keeper.Lock and not busy and not hasBall then
 		local inward = -outward
 		local tz, depth
-		if threat then
+		local d2goal = horiz(bp - Vector3.new(gx, 0, gz)).Magnitude
+		local rush = Keeper.Rush and possession == "other" and not threat and d2goal < Keeper.RushRange
+		if rush then
+			-- somebody dribbles at you: come off the line to the ball, on the line ball -> goal centre, to shrink the angle
+			local dirv = horiz(Vector3.new(gx, 0, gz) - bp)
+			dirv = dirv.Magnitude > 0.5 and dirv.Unit or Vector3.new(inward, 0, 0)
+			local want = bp + dirv * 4.5
+			tz = math.clamp(want.Z, gz - (half - 1.5), gz + (half - 1.5))
+			depth = math.clamp((want.X - lineX) * inward, 1.5, Keeper.RushRange)
+			if horiz(bp - root.Position).Magnitude < 9 and os.clock() - lastDive > 1.6 then
+				lastDive = os.clock()
+				press("Smother")
+				Log.add(("keeper: rush smother, ball %.1f studs away"):format(horiz(bp - root.Position).Magnitude))
+			end
+		elseif threat then
 			tz = math.clamp(threat.z, gz - (half - 1), gz + (half - 1))
 			depth = 2.5
 		else
@@ -134,16 +168,16 @@ local function step(dt)
 			local dirv = horiz(bp - centre)
 			if dirv.Magnitude < 1 then dirv = Vector3.new(inward, 0, 0) end
 			dirv = dirv.Unit
-			local want = Vector3.new(gx, 0, gz) + dirv * math.min(Keeper.Out, (horiz(bp - centre)).Magnitude * 0.5)
+			local want = Vector3.new(lineX, 0, gz) + dirv * math.min(Keeper.Out, (horiz(bp - centre)).Magnitude * 0.5)
 			tz = math.clamp(want.Z, gz - (half - 1.5), gz + (half - 1.5))
-			depth = math.clamp((want.X - gx) * inward, 1.5, Keeper.Out + 2)
+			depth = math.clamp((want.X - lineX) * inward, 1.5, Keeper.Out + 2)
 		end
-		local target = Vector3.new(gx + inward * depth, root.Position.Y, tz)
+		local target = Vector3.new(lineX + inward * depth, root.Position.Y, tz)
 		local cur = root.Position
 		local delta = horiz(target - cur)
 		local mag = delta.Magnitude
 		if mag > 0.25 then
-			local sp = Keeper.Speed * (threat and 1.8 or 1)
+			local sp = Keeper.Speed * ((threat or rush) and 1.8 or 1)
 			local np = cur + delta.Unit * math.min(mag, sp * dt)
 			local face = root.CFrame - root.CFrame.Position
 			if Keeper.FaceBall then
@@ -160,7 +194,7 @@ local function step(dt)
 		local right = cam and horiz(cam.CFrame.RightVector)
 		if right and right.Magnitude > 0.05 then
 			right = right.Unit
-			local cross = Vector3.new(gx, threat.y, threat.z)
+			local cross = Vector3.new(lineX, threat.y, threat.z)
 			local rel = horiz(cross - root.Position)
 			local lat = rel:Dot(right)
 			local high = threat.y - root.Position.Y > 3.4
@@ -206,6 +240,7 @@ function Keeper.Set(on)
 end
 
 function Keeper.Destroy()
+	if flightConn then flightConn:Disconnect(); flightConn = nil end
 	if conn then conn:Disconnect(); conn = nil end
 	Keeper.Enabled = false
 end
