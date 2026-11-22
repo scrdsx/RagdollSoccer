@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.7.4 (bundled by build.py)
+-- Ragdoll Soccer v0.8.0 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.7.4"
+__env.RSVersion = "0.8.0"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -2067,7 +2067,7 @@ local Keeper = {
 	Out = 7,           -- how far off the goal line you stand when the ball is far (studs)
 	Speed = 42,        -- slide speed of the goal-line lock (studs/s)
 	MinDive = 2.2,     -- a shot this close to you is not dived at (you are already there)
-	Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
+	Blatant = true, TeleAt = 0.18, Smother = true, Rush = true, RushRange = 30, Saves = 0, Info = "off",
 }
 
 local conn
@@ -2075,6 +2075,7 @@ local vel, lastPos = Vector3.zero, nil
 local lastDive, lastLog, lastState = -99, -99, -99
 local floorY, loggedGoal = nil, false
 local flight, flightBall, flightConn
+local holdPos, holdUntil = nil, 0
 
 -- the server's own KickFlight record: exact start position and velocity of every kick, known the moment it happens
 local function hookFlight(ball)
@@ -2194,6 +2195,24 @@ local function step(dt)
 
 	local hasBall = possession == "me"
 	local busy = me.state ~= nil and me.state ~= "Animated"
+
+	-- BLATANT: the moment before the ball crosses the line you are simply standing exactly where it arrives (held for half a second so it hits you)
+	if Keeper.Blatant and threat and not hasBall and threat.t <= Keeper.TeleAt then
+		local tz = math.clamp(threat.z, gz - half, gz + half)
+		holdPos = Vector3.new(lineX - outward * 1.6, math.clamp(threat.y, root.Position.Y, root.Position.Y + 8), tz)
+		holdUntil = os.clock() + 0.5
+		Keeper.Saves = Keeper.Saves + 1
+		Log.add(("keeper: BLOCK at z %.1f height %.1f (ball was %.2fs away)"):format(tz - gz, holdPos.Y - root.Position.Y, threat.t))
+	end
+	local holding = false
+	if holdPos and os.clock() < holdUntil and not hasBall then
+		holding = true
+		local face = Keeper.FaceBall and CFrame.lookAt(Vector3.zero, horiz(bp - holdPos).Magnitude > 0.5 and horiz(bp - holdPos) or Vector3.new(-outward, 0, 0)) or (root.CFrame - root.CFrame.Position)
+		pcall(function() root.CFrame = CFrame.new(holdPos) * face; root.AssemblyLinearVelocity = Vector3.zero end)
+	else
+		holdPos = nil
+	end
+	busy = busy or holding
 
 	-- goal-line lock
 	if Keeper.Lock and not busy and not hasBall then
@@ -2402,6 +2421,9 @@ mKeep:Slider({ Name = "Slide speed", Min = 15, Max = 120, Step = 1, Default = Ke
 mKeep:Toggle({ Name = "Face the ball", Default = true, Callback = function(v) Keeper.FaceBall = v end })
 mKeep:Toggle({ Name = "Rush out at dribblers (shrinks the angle, smothers)", Default = true, Callback = function(v) Keeper.Rush = v end })
 mKeep:Slider({ Name = "Rush when the ball is within", Min = 10, Max = 60, Step = 1, Default = Keeper.RushRange, Suffix = " st", Callback = function(v) Keeper.RushRange = v end })
+mKeep:Section("Blatant")
+mKeep:Toggle({ Name = "Block shots: appear exactly where the ball arrives", Default = true, Callback = function(v) Keeper.Blatant = v end })
+mKeep:Slider({ Name = "Troll delay (how late you pop in)", Min = 0.05, Max = 0.6, Step = 0.01, Default = Keeper.TeleAt, Suffix = " s", Callback = function(v) Keeper.TeleAt = v end })
 mKeep:Section("Dives")
 mKeep:Toggle({ Name = "Auto dive at shots", Default = true, Callback = function(v) Keeper.Dive = v end })
 mKeep:Slider({ Name = "Dive this early", Min = 0.2, Max = 1.2, Step = 0.05, Default = Keeper.Reaction, Suffix = " s", Callback = function(v) Keeper.Reaction = v end })
