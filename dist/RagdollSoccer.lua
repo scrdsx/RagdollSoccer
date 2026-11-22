@@ -1,6 +1,6 @@
--- Ragdoll Soccer v0.7.3 (bundled by build.py)
+-- Ragdoll Soccer v0.7.4 (bundled by build.py)
 local __env = getgenv and getgenv() or _G
-__env.RSVersion = "0.7.3"
+__env.RSVersion = "0.7.4"
 local __mods, __cache = {}, {}
 local function __import(n)
 	if __cache[n] == nil then __cache[n] = __mods[n]() end
@@ -2072,7 +2072,7 @@ local Keeper = {
 
 local conn
 local vel, lastPos = Vector3.zero, nil
-local lastDive, lastLog = -99, -99
+local lastDive, lastLog, lastState = -99, -99, -99
 local floorY, loggedGoal = nil, false
 local flight, flightBall, flightConn
 
@@ -2084,6 +2084,7 @@ local function hookFlight(ball)
 	flightConn = ball:GetAttributeChangedSignal("KickFlight"):Connect(function()
 		local f = string.split(tostring(ball:GetAttribute("KickFlight")), "|")
 		local px, py, pz, vx, vy, vz = tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7]), tonumber(f[8]), tonumber(f[9])
+		Log.add("keeper: kick seen " .. tostring(ball:GetAttribute("KickFlight")):sub(1, 90))
 		if px and pz and vx and vz then flight = { p = Vector3.new(px, py, pz), v = Vector3.new(vx, vy or 0, vz), t0 = os.clock() } end
 	end)
 end
@@ -2225,6 +2226,10 @@ local function step(dt)
 			depth = math.clamp((want.X - lineX) * inward, 1.5, Keeper.Out + 2)
 		end
 		local target = Vector3.new(lineX + inward * depth, root.Position.Y, tz)
+		if d2goal < 50 and os.clock() - lastState > 0.7 then
+			lastState = os.clock()
+			Log.add(("keeper state: me (%.0f, %.0f) -> (%.0f, %.0f) | ball (%.0f, %.0f) %s | %s%s | goal line x %.0f"):format(root.Position.X, root.Position.Z, target.X, target.Z, bp.X, bp.Z, possession, rush and "RUSH" or "hold", threat and " THREAT" or "", lineX))
+		end
 		local cur = root.Position
 		local delta = horiz(target - cur)
 		local mag = delta.Magnitude
